@@ -1,0 +1,16 @@
+# PyInstaller 打包产物
+build/
+dist/
+*.spec
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 运行时生成的配置和数据
+config.json
+*.csv
+
+# 图标文件（可选，按需保留）
+# icon.ico
