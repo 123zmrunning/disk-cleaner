@@ -20,7 +20,7 @@
 import subprocess
 import os
 import time
-from config import get_desktop_path
+from config import get_desktop_path, get_app_dir
 
 
 def build_export_path(export_dir: str = "") -> str:
@@ -40,6 +40,12 @@ def run_wiztree_scan(wiztree_path: str, export_path: str,
     启动WizTree扫描C盘并导出CSV，等待完成。
     返回值：(成功: bool, 文件路径或错误信息: str)
     """
+
+    # 优先使用捆绑在同目录下的 WizTree
+    if not wiztree_path or not os.path.isfile(wiztree_path):
+        bundled = os.path.join(get_app_dir(), "WizTree64.exe")
+        if os.path.isfile(bundled):
+            wiztree_path = bundled
 
     def notify(msg):
         if progress_callback:

@@ -117,7 +117,7 @@ class CleanupItem:
 #   不懂正则也没关系，把它理解为"模糊匹配路径中包含某段文字"即可
 # ==============================================================
 # 知识库来源及更新日期（联网核实）
-KNOWLEDGE_DATE = "2026-05-24"
+KNOWLEDGE_DATE = "2026-05-26"
 KNOWLEDGE_SOURCES = (
     "Microsoft Learn · ElevenForum · MakeUseOf · GeekChamp · WindowsForum（2025-2026年核实）\n"
     "核实结论：WinSxS 不可直接删除；Prefetch 可删但影响启动速度；\n"
@@ -433,6 +433,182 @@ CLEANUP_RULES = [
         ),
         "method": "同上，建议通过软件自带功能清理",
         "risk": "🟡 低-中风险",
+    },
+
+    # ── 优先级1新增：主流应用缓存（无风险）─────────────────────────
+    {
+        "pattern": r"\\discord\\[Cc]ache",
+        "priority": 1,
+        "name": "Discord 聊天缓存",
+        "reason": "Discord缓存的头像、图片、视频等，删除后自动重建。",
+        "method": "直接删除",
+        "risk": "✅ 无风险",
+    },
+    {
+        "pattern": r"\\Spotify\\[Ss]torage",
+        "priority": 1,
+        "name": "Spotify 音乐缓存",
+        "reason": "Spotify离线缓存文件，删除后重新播放时自动下载。",
+        "method": "直接删除",
+        "risk": "✅ 无风险",
+    },
+    {
+        "pattern": r"\\steam\\htmlcache",
+        "priority": 1,
+        "name": "Steam 内置浏览器缓存",
+        "reason": "Steam客户端内置Chromium浏览器的缓存文件。",
+        "method": "直接删除",
+        "risk": "✅ 无风险",
+    },
+    {
+        "pattern": r"\\EpicGamesLauncher\\.*[Cc]ache",
+        "priority": 1,
+        "name": "Epic Games 启动器缓存",
+        "reason": "Epic Games启动器缓存，删除后自动重建。",
+        "method": "直接删除",
+        "risk": "✅ 无风险",
+    },
+
+    # ── 优先级2新增：各类软件缓存（低风险）─────────────────────────
+    {
+        "pattern": r"\\Steam\\steamapps\\downloading",
+        "priority": 2,
+        "name": "Steam 游戏下载临时文件",
+        "reason": "Steam正在下载但未完成的游戏文件，删除后需重新下载。",
+        "method": "通过Steam暂停并取消下载后删除",
+        "risk": "🟡 低风险（取消下载后才可删）",
+    },
+    {
+        "pattern": r"\\Steam\\steamapps\\workshop\\downloads",
+        "priority": 2,
+        "name": "Steam Workshop 下载缓存",
+        "reason": "Steam创意工坊的下载缓存，删除后可重新订阅下载。",
+        "method": "直接删除",
+        "risk": "✅ 无风险",
+    },
+    {
+        "pattern": r"\\Code\\CachedData",
+        "priority": 2,
+        "name": "VS Code 扩展缓存（CachedData）",
+        "reason": "VS Code扩展的编译缓存，删除后首次启动会重新生成，稍慢。",
+        "method": "直接删除",
+        "risk": "✅ 无风险（会自动重建）",
+    },
+    {
+        "pattern": r"\\Code\\logs",
+        "priority": 2,
+        "name": "VS Code 运行日志",
+        "reason": "VS Code产生的运行日志文件，对日常使用无用。",
+        "method": "直接删除",
+        "risk": "✅ 无风险",
+    },
+    {
+        "pattern": r"\.IntelliJIdea.*\\system\\caches|\.idea\\.*[Cc]ache|\\JetBrains\\.*\\caches",
+        "priority": 2,
+        "name": "JetBrains IDE 缓存",
+        "reason": "IntelliJ IDEA、PyCharm、WebStorm等JetBrains系IDE的索引缓存，删除后重启IDE自动重建（会花几分钟重建索引）。",
+        "method": "直接删除，或通过IDE菜单 File→Invalidate Caches",
+        "risk": "🟡 低风险（重启IDE需重建索引）",
+    },
+    {
+        "pattern": r"\\Adobe\\.*[Cc]ache|\\Adobe\\.*[Tt]emp",
+        "priority": 2,
+        "name": "Adobe 软件缓存",
+        "reason": "Photoshop、Premiere、After Effects等Adobe软件的临时缓存文件。",
+        "method": "各软件设置内清除，或直接删除",
+        "risk": "✅ 无风险",
+    },
+    {
+        "pattern": r"\\Adobe Media Cache",
+        "priority": 2,
+        "name": "Adobe Media Cache（视频预览缓存）",
+        "reason": "Premiere Pro为视频文件生成的预览缓存，删除后Premiere重新处理时自动重建（会花时间）。",
+        "method": "Premiere Pro→首选项→媒体→清除媒体缓存文件",
+        "risk": "🟡 低风险（重新打开项目需等待重建）",
+    },
+    {
+        "pattern": r"\\Tencent\\QQMusic",
+        "priority": 2,
+        "name": "QQ音乐缓存",
+        "reason": "QQ音乐缓存的音乐文件封面等，删除后重新播放时自动下载。",
+        "method": "直接删除",
+        "risk": "✅ 无风险",
+    },
+    {
+        "pattern": r"\\netease\\cloudmusic\\.*[Cc]ache",
+        "priority": 2,
+        "name": "网易云音乐缓存",
+        "reason": "网易云音乐本地缓存，删除后重新播放时自动下载。",
+        "method": "直接删除或通过网易云音乐设置→清除缓存",
+        "risk": "✅ 无风险",
+    },
+    {
+        "pattern": r"\\DingTalk\\.*[Cc]ache",
+        "priority": 2,
+        "name": "钉钉缓存",
+        "reason": "钉钉客户端缓存的头像、文件预览等，删除后自动重新下载。",
+        "method": "直接删除",
+        "risk": "✅ 无风险",
+    },
+    {
+        "pattern": r"\\Lark\\.*[Cc]ache|\\feishu\\.*[Cc]ache",
+        "priority": 2,
+        "name": "飞书缓存",
+        "reason": "飞书客户端缓存，删除后自动重建。",
+        "method": "直接删除",
+        "risk": "✅ 无风险",
+    },
+    {
+        "pattern": r"\\Microsoft\\Teams\\.*[Cc]ache",
+        "priority": 2,
+        "name": "Microsoft Teams 缓存",
+        "reason": "Teams客户端缓存，积累较快，删除后自动重建。",
+        "method": "直接删除",
+        "risk": "✅ 无风险",
+    },
+    {
+        "pattern": r"\\AppData\\Roaming\\Zoom\\data",
+        "priority": 2,
+        "name": "Zoom 会议缓存",
+        "reason": "Zoom缓存的会议背景、头像等数据。",
+        "method": "直接删除",
+        "risk": "✅ 无风险",
+    },
+    {
+        "pattern": r"\.npm\\_npx|npm-cache",
+        "priority": 2,
+        "name": "npm 包管理器缓存",
+        "reason": "npm下载包时产生的本地缓存，删除后npm重新下载时自动重建。",
+        "method": "`npm cache clean --force` 或直接删除",
+        "risk": "✅ 无风险",
+    },
+
+    # ── 优先级3新增：游戏缓存（中等影响）───────────────────────────
+    {
+        "pattern": r"\\League of Legends\\.*[Cc]ache",
+        "priority": 3,
+        "name": "英雄联盟游戏缓存",
+        "reason": "英雄联盟缓存的游戏资源，删除后下次启动游戏重新下载（时间较长）。",
+        "method": "直接删除",
+        "risk": "🟡 中等（下次启动需重新下载资源）",
+    },
+    {
+        "pattern": r"\.minecraft\\.*[Cc]ache|\\minecraft\\.*[Cc]ache",
+        "priority": 3,
+        "name": "Minecraft 游戏缓存",
+        "reason": "Minecraft的着色器和资源缓存。",
+        "method": "直接删除",
+        "risk": "🟡 低风险",
+    },
+
+    # ── 优先级4新增：实际文件（高风险，建议迁移而非删除）──────────
+    {
+        "pattern": r"\\WeChat Files\\.*\\FileStorage\\File",
+        "priority": 4,
+        "name": "微信接收文件（建议移至D盘）",
+        "reason": "微信聊天中接收的文件。注意：这是实际文件，不是缓存！删除后无法恢复。建议移动到D盘而非删除。",
+        "method": "微信→设置→聊天→迁移聊天记录，或手动移动文件夹到D盘",
+        "risk": "⚠️ 高风险（实际文件，删除不可恢复，建议移动而非删除）",
     },
 ]
 

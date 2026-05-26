@@ -6,8 +6,9 @@ import threading
 import subprocess
 import os
 import sys
+import json
 
-from config import load_config, save_config, get_desktop_path
+from config import load_config, save_config, get_desktop_path, get_app_dir
 from scanner import run_wiztree_scan, build_export_path
 from analyzer import run_analysis, CleanupItem, KNOWLEDGE_DATE, KNOWLEDGE_SOURCES
 from reporter import generate_report, bytes_to_human
@@ -64,7 +65,7 @@ class DiskCleanerApp(ctk.CTk):
         ctk.set_appearance_mode(self.config.get("theme", "dark"))
         ctk.set_default_color_theme("blue")
 
-        self.title("磁盘清理助手 v2.0  |  C盘空间分析工具")
+        self.title("磁盘清理助手 v3.0  |  C盘空间分析工具")
         self.geometry("1060x740")
         self.minsize(860, 620)
 
@@ -73,6 +74,7 @@ class DiskCleanerApp(ctk.CTk):
             self.iconbitmap(icon_path)
 
         self.analysis_result = None
+        self._cleanup_checkboxes = {}
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -116,7 +118,7 @@ class DiskCleanerApp(ctk.CTk):
         toolbar.grid(row=0, column=0, sticky="ew")
         toolbar.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(toolbar, text="🔍 磁盘清理助手 v2.0",
+        ctk.CTkLabel(toolbar, text="🔍 磁盘清理助手 v3.0",
                      font=ctk.CTkFont(size=20, weight="bold")).grid(
             row=0, column=0, padx=15, pady=15, sticky="w")
 
@@ -179,12 +181,14 @@ class DiskCleanerApp(ctk.CTk):
         self.tab_cleanup  = self.tabview.add("🧹 清理建议")
         self.tab_detail   = self.tabview.add("📁 目录详情")
         self.tab_report   = self.tabview.add("📄 报告操作")
+        self.tab_history  = self.tabview.add("📋 历史记录")
         self.tab_settings = self.tabview.add("⚙️ 设置")
 
         self._build_tab_overview()
         self._build_tab_cleanup()
         self._build_tab_detail()
         self._build_tab_report()
+        self._build_tab_history()
         self._build_tab_settings()
 
     def _build_tab_overview(self):
@@ -285,6 +289,12 @@ class DiskCleanerApp(ctk.CTk):
             font=ctk.CTkFont(size=13), command=self._on_exec_cleanup,
             state="disabled", fg_color=COLORS["danger"], hover_color="#c0392b")
         self.exec_cleanup_btn.pack(side="left", padx=5)
+
+        self.exec_selected_btn = ctk.CTkButton(
+            btn_frame, text="☑️  执行选中项", width=200, height=40,
+            font=ctk.CTkFont(size=13), command=self._on_exec_selected,
+            state="disabled", fg_color=COLORS["warning"], hover_color="#d35400")
+        self.exec_selected_btn.pack(side="left", padx=5)
 
         self.last_csv_label = ctk.CTkLabel(tab, text="",
                                            font=ctk.CTkFont(size=11),
@@ -388,7 +398,7 @@ class DiskCleanerApp(ctk.CTk):
         about_box.grid(row=row, column=0, columnspan=4, sticky="ew", padx=15, pady=(0, 15))
         ctk.CTkLabel(about_box,
                      text=(
-                         f"磁盘清理助手  v2.0          知识库更新日期：{KNOWLEDGE_DATE}\n\n"
+                         f"磁盘清理助手  v3.0          知识库更新日期：{KNOWLEDGE_DATE}\n\n"
                          f"本次联网核实新增/更新的清理规则：\n"
                          f"  • AMD GPU 着色器缓存（DxCache / GLCache）\n"
                          f"  • DirectX 系统着色器缓存（D3DSCache）\n"
@@ -421,7 +431,7 @@ class DiskCleanerApp(ctk.CTk):
         dialog.grab_set()
         dialog.lift()
 
-        ctk.CTkLabel(dialog, text="欢迎使用磁盘清理助手 v2.0",
+        ctk.CTkLabel(dialog, text="欢迎使用磁盘清理助手 v3.0",
                      font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(22, 6))
         ctk.CTkLabel(dialog,
                      text="本软件需要配合 WizTree 运行磁盘扫描。\n"
@@ -555,6 +565,7 @@ class DiskCleanerApp(ctk.CTk):
 
         self.save_report_btn.configure(state="normal")
         self.exec_cleanup_btn.configure(state="normal")
+        self.exec_selected_btn.configure(state="normal")
         self.scan_btn.configure(state="normal", text="🚀  开始扫描 C盘")
         self.last_csv_label.configure(text=f"最近扫描文件：{csv_path}")
         self.tabview.set("🧹 清理建议")
@@ -649,7 +660,7 @@ class DiskCleanerApp(ctk.CTk):
         self.tab_overview.grid_rowconfigure(2, weight=1)
         table_frame.grid_columnconfigure(1, weight=1)
 
-        for col, (text, w) in enumerate([("排名", 40), ("路径", 0), ("大小", 80), ("", 38)]):
+        for col, (text, w) in enumerate([("排名", 40), ("路径", 0), ("大小", 80), ("占比", 60), ("", 38)]):
             ctk.CTkLabel(table_frame, text=text, width=w,
                          font=ctk.CTkFont(weight="bold")).grid(
                 row=0, column=col, padx=5, pady=3, sticky="w" if col == 1 else "")
@@ -665,10 +676,14 @@ class DiskCleanerApp(ctk.CTk):
             ctk.CTkLabel(table_frame, text=bytes_to_human(folder.size_bytes),
                          width=80, fg_color=bg, corner_radius=3).grid(
                 row=i, column=2, padx=5, pady=2)
+            pct_str = f"{folder.size_bytes / disk_info.total_bytes * 100:.1f}%"
+            ctk.CTkLabel(table_frame, text=pct_str,
+                         width=60, fg_color=bg, corner_radius=3).grid(
+                row=i, column=3, padx=5, pady=2)
             ctk.CTkButton(table_frame, text="📂", width=36, height=26,
                           fg_color="transparent", hover_color=("gray80", "gray30"),
                           command=lambda p=folder.path: _open_folder(p)).grid(
-                row=i, column=3, padx=5, pady=2)
+                row=i, column=4, padx=5, pady=2)
 
     def _draw_treemap(self, canvas, folders, disk_info):
         """在 Canvas 上绘制磁盘空间比例缩略图"""
@@ -730,6 +745,7 @@ class DiskCleanerApp(ctk.CTk):
                                    fill="white", font=("Arial", 9, "bold"), anchor="center")
 
     def _update_tab_cleanup(self, analysis: dict):
+        self._cleanup_checkboxes = {}
         cleanup_items = analysis.get("cleanup_items", [])
         reclaimable = analysis.get("total_reclaimable_bytes", 0)
         p1_count = sum(1 for x in cleanup_items if x.priority == 1)
@@ -768,15 +784,23 @@ class DiskCleanerApp(ctk.CTk):
     def _make_cleanup_card(self, parent, item: CleanupItem) -> ctk.CTkFrame:
         color = PRIORITY_COLORS.get(item.priority, "gray")
         card = ctk.CTkFrame(parent, corner_radius=8, border_width=1, border_color=color)
-        card.grid_columnconfigure(1, weight=1)
+        card.grid_columnconfigure(2, weight=1)
+
+        # 勾选框
+        var = ctk.BooleanVar(value=False)
+        self._cleanup_checkboxes[item.path] = var
+        cb = ctk.CTkCheckBox(card, variable=var, text="", width=26, height=26,
+                             checkbox_width=20, checkbox_height=20,
+                             command=self._on_checkbox_change)
+        cb.grid(row=0, column=0, rowspan=5, padx=(8, 0), pady=5)
 
         # 左侧彩色竖条
         ctk.CTkFrame(card, width=5, fg_color=color, corner_radius=4).grid(
-            row=0, column=0, rowspan=5, sticky="ns", padx=(5, 8), pady=5)
+            row=0, column=1, rowspan=5, sticky="ns", padx=(5, 8), pady=5)
 
         # 名称 + 大小
         name_frame = ctk.CTkFrame(card, fg_color="transparent")
-        name_frame.grid(row=0, column=1, sticky="ew", pady=(8, 2))
+        name_frame.grid(row=0, column=2, sticky="ew", pady=(8, 2))
         name_frame.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(name_frame, text=item.name,
                      font=ctk.CTkFont(size=13, weight="bold"), anchor="w").grid(
@@ -787,7 +811,7 @@ class DiskCleanerApp(ctk.CTk):
 
         # 路径 + 打开按钮（可点击访问）
         path_row = ctk.CTkFrame(card, fg_color="transparent")
-        path_row.grid(row=1, column=1, sticky="ew", pady=2)
+        path_row.grid(row=1, column=2, sticky="ew", pady=2)
         path_row.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(path_row, text=f"路径：{item.path}",
@@ -803,7 +827,7 @@ class DiskCleanerApp(ctk.CTk):
         # 风险 + 操作方法
         ctk.CTkLabel(card, text=f"风险：{item.risk}  ｜  操作：{item.method}",
                      font=ctk.CTkFont(size=11), anchor="w").grid(
-            row=2, column=1, sticky="ew", pady=2)
+            row=2, column=2, sticky="ew", pady=2)
 
         # 折叠的判断依据
         reason_text = ctk.CTkLabel(
@@ -815,7 +839,7 @@ class DiskCleanerApp(ctk.CTk):
         def toggle():
             expanded[0] = not expanded[0]
             if expanded[0]:
-                reason_text.grid(row=4, column=1, sticky="ew", padx=5, pady=(0, 8))
+                reason_text.grid(row=4, column=2, sticky="ew", padx=5, pady=(0, 8))
                 btn_holder[0].configure(text="▼ 收起判断依据")
             else:
                 reason_text.grid_forget()
@@ -826,7 +850,7 @@ class DiskCleanerApp(ctk.CTk):
             font=ctk.CTkFont(size=11), fg_color="transparent",
             text_color=COLORS["info"], hover_color=("gray85", "gray25"),
             command=toggle, anchor="w")
-        toggle_btn.grid(row=3, column=1, sticky="w", pady=(0, 5))
+        toggle_btn.grid(row=3, column=2, sticky="w", pady=(0, 5))
         btn_holder[0] = toggle_btn
         return card
 
@@ -899,11 +923,199 @@ class DiskCleanerApp(ctk.CTk):
             except Exception as e:
                 errors.append(f"{item.name}: {e}")
 
+        freed = sum(x.size_bytes for x in p1_items)
+        self._save_history_record(p1_items, freed)
+        self._update_tab_history()
         if errors:
             messagebox.showwarning("部分清理失败", "以下项目清理失败：\n" + "\n".join(errors))
         else:
             messagebox.showinfo("清理完成", f"清理完成！共释放约 {total}。\n\n建议重新扫描查看最新状态。")
         self._set_status("清理完成")
+
+    # ── 勾选框相关 ──────────────────────────────────────────────────
+
+    def _on_checkbox_change(self):
+        any_checked = any(v.get() for v in self._cleanup_checkboxes.values())
+        state = "normal" if any_checked else "disabled"
+        self.exec_selected_btn.configure(state=state)
+
+    def _on_exec_selected(self):
+        selected = [item for item in self.analysis_result.get("cleanup_items", [])
+                    if self._cleanup_checkboxes.get(item.path, ctk.BooleanVar()).get()]
+        if not selected:
+            messagebox.showinfo("未选择", "请先勾选要清理的项目。")
+            return
+        preview = "\n".join(
+            f"  • {item.name}\n    路径：{item.path}\n    大小：{bytes_to_human(item.size_bytes)}"
+            for item in selected)
+        total = bytes_to_human(sum(x.size_bytes for x in selected))
+        if not messagebox.askyesno("确认清理",
+                                   f"即将删除以下选中项目（共 {total}）：\n\n{preview}\n\n确认删除？（此操作不可撤销）"):
+            return
+        self._set_status("正在执行清理...")
+        errors = []
+        for item in selected:
+            path = item.path.strip('"')
+            try:
+                subprocess.run(
+                    ["powershell", "-Command",
+                     f'Remove-Item -Path "{path}" -Recurse -Force -ErrorAction SilentlyContinue'],
+                    timeout=60, capture_output=True)
+            except Exception as e:
+                errors.append(f"{item.name}: {e}")
+        freed = sum(x.size_bytes for x in selected)
+        self._save_history_record(selected, freed)
+        self._update_tab_history()
+        if errors:
+            messagebox.showwarning("部分清理失败", "以下项目清理失败：\n" + "\n".join(errors))
+        else:
+            messagebox.showinfo("清理完成", f"清理完成！共释放约 {total}。\n\n建议重新扫描查看最新状态。")
+        self._set_status("清理完成")
+
+    # ── 历史记录标签页 ───────────────────────────────────────────────
+
+    def _build_tab_history(self):
+        tab = self.tab_history
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+
+        # 折线图区域
+        chart_frame = ctk.CTkFrame(tab, height=180, corner_radius=8)
+        chart_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 5))
+        chart_frame.grid_propagate(False)
+        chart_frame.grid_columnconfigure(0, weight=1)
+        chart_frame.grid_rowconfigure(0, weight=1)
+
+        ctk.CTkLabel(chart_frame, text="C盘使用率趋势",
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=10, pady=(8, 0))
+
+        is_dark = ctk.get_appearance_mode().lower() == "dark"
+        bg = "#1e1e2e" if is_dark else "#f0f0f0"
+        self._history_canvas = tk.Canvas(chart_frame, height=130, bg=bg,
+                                         highlightthickness=1,
+                                         highlightbackground="#444" if is_dark else "#ccc")
+        self._history_canvas.pack(fill="x", padx=8, pady=(2, 8))
+
+        # 记录列表区域
+        self._history_scroll = ctk.CTkScrollableFrame(tab, label_text="清理历史记录")
+        self._history_scroll.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self._history_scroll.grid_columnconfigure(0, weight=1)
+
+        self._update_tab_history()
+
+    def _load_history(self) -> list:
+        path = os.path.join(get_app_dir(), "cleanup_history.json")
+        if not os.path.isfile(path):
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+
+    def _save_history_record(self, items, freed_bytes: int):
+        path = os.path.join(get_app_dir(), "cleanup_history.json")
+        records = self._load_history()
+        disk_pct = 0.0
+        if self.analysis_result and self.analysis_result.get("disk_info"):
+            disk_pct = self.analysis_result["disk_info"].used_percent
+        records.append({
+            "time": __import__('time').strftime("%Y-%m-%d %H:%M"),
+            "items": [item.name for item in items],
+            "freed_bytes": freed_bytes,
+            "disk_used_percent": disk_pct,
+        })
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(records, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _update_tab_history(self):
+        records = self._load_history()
+        # 重绘折线图
+        self._draw_history_chart(self._history_canvas, records)
+        # 重建列表
+        for w in self._history_scroll.winfo_children():
+            w.destroy()
+        if not records:
+            ctk.CTkLabel(self._history_scroll,
+                         text="暂无清理记录。执行清理后将自动记录在这里。",
+                         text_color=COLORS["text_dim"],
+                         font=ctk.CTkFont(size=13)).grid(row=0, column=0, pady=30)
+            return
+        for i, rec in enumerate(reversed(records)):
+            bg = ("gray90", "gray20") if i % 2 == 0 else ("gray85", "gray25")
+            card = ctk.CTkFrame(self._history_scroll, fg_color=bg, corner_radius=6)
+            card.grid(row=i, column=0, sticky="ew", padx=3, pady=3)
+            card.grid_columnconfigure(1, weight=1)
+            ctk.CTkLabel(card, text=rec.get("time", ""), width=130,
+                         font=ctk.CTkFont(size=11, weight="bold")).grid(row=0, column=0, padx=10, pady=6)
+            items_str = "、".join(rec.get("items", []))
+            ctk.CTkLabel(card, text=items_str, anchor="w",
+                         font=ctk.CTkFont(size=11), wraplength=500).grid(row=0, column=1, sticky="ew", padx=5)
+            freed = bytes_to_human(rec.get("freed_bytes", 0))
+            pct = rec.get("disk_used_percent", 0)
+            ctk.CTkLabel(card, text=f"释放 {freed} | 使用率 {pct}%",
+                         font=ctk.CTkFont(size=10), text_color=COLORS["success"]).grid(row=0, column=2, padx=10)
+
+    def _draw_history_chart(self, canvas, records):
+        canvas.update_idletasks()
+        w = canvas.winfo_width()
+        h = canvas.winfo_height()
+        if w < 10:
+            w = 600
+        if h < 10:
+            h = 130
+        canvas.delete("all")
+        is_dark = ctk.get_appearance_mode().lower() == "dark"
+        text_color = "white" if is_dark else "#333"
+        grid_color = "#333" if is_dark else "#ccc"
+
+        if len(records) < 2:
+            canvas.create_text(w // 2, h // 2,
+                               text="暂无足够数据绘制趋势图（至少需要2次清理记录）",
+                               fill=text_color, font=("Arial", 10))
+            return
+
+        pad_l, pad_r, pad_t, pad_b = 50, 20, 15, 30
+        chart_w = w - pad_l - pad_r
+        chart_h = h - pad_t - pad_b
+
+        pcts = [r.get("disk_used_percent", 0) for r in records]
+        min_p = max(0, min(pcts) - 5)
+        max_p = min(100, max(pcts) + 5)
+        if max_p == min_p:
+            max_p = min_p + 10
+
+        # 网格线
+        for pct_val in range(int(min_p // 10) * 10, int(max_p) + 10, 10):
+            if min_p <= pct_val <= max_p:
+                y = pad_t + chart_h - (pct_val - min_p) / (max_p - min_p) * chart_h
+                canvas.create_line(pad_l, y, w - pad_r, y, fill=grid_color, dash=(2, 4))
+                canvas.create_text(pad_l - 5, y, text=f"{pct_val}%",
+                                   fill=text_color, font=("Arial", 8), anchor="e")
+
+        # 折线
+        n = len(records)
+        points = []
+        for i, r in enumerate(records):
+            x = pad_l + i / (n - 1) * chart_w
+            y = pad_t + chart_h - (r.get("disk_used_percent", 0) - min_p) / (max_p - min_p) * chart_h
+            points.append((x, y))
+
+        for i in range(len(points) - 1):
+            canvas.create_line(points[i][0], points[i][1],
+                               points[i+1][0], points[i+1][1],
+                               fill=COLORS["info"], width=2)
+
+        for i, (x, y) in enumerate(points):
+            canvas.create_oval(x - 4, y - 4, x + 4, y + 4,
+                               fill=COLORS["info"], outline="white", width=1)
+            if i % max(1, n // 6) == 0 or i == n - 1:
+                time_str = records[i].get("time", "")[-5:]
+                canvas.create_text(x, h - pad_b + 8, text=time_str,
+                                   fill=text_color, font=("Arial", 7))
 
     # ── 工具方法 ────────────────────────────────────────────────────
 
