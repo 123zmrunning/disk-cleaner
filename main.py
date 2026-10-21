@@ -1,55 +1,73 @@
 # ==============================================================
 # main.py —— 程序入口
 # ==============================================================
-# 【作用】这是整个程序的启动入口。
-#         双击运行这个文件（或通过启动.bat），软件就会打开。
-#
-# 【为什么需要单独的 main.py】
-#   把启动逻辑和界面逻辑分开是好习惯。
-#   main.py 只做一件事：检查依赖、然后启动应用。
-#   这样出错时更容易定位问题。
+# 只做三件事：检查依赖、设置工作目录、启动界面。
+# 出错时把 traceback 写到 %APPDATA%\DiskCleaner\error.log，
+# 方便用户把日志发回来排查（打包成 EXE 后没有控制台）。
 # ==============================================================
 
-import sys
 import os
+import sys
+import time
+import traceback
 
 # ── 依赖检查 ──────────────────────────────────────────────────
-# 在导入 customtkinter 前先检查它是否已安装
-# 如果没安装，给出清晰的安装提示
 try:
-    import customtkinter
+    import customtkinter  # noqa: F401
 except ImportError:
-    # 这段代码在 customtkinter 未安装时会执行
     print("=" * 60)
     print("错误：未安装 customtkinter 库")
     print()
-    print("请在命令提示符（cmd）中运行以下命令安装：")
+    print("请在命令提示符（cmd）中运行：")
     print()
-    print("    pip install customtkinter")
+    print("    pip install -r requirements.txt")
     print()
-    print("如果 pip 命令不可用，说明 Python 未正确安装。")
-    print("请到 https://www.python.org/downloads/ 下载安装 Python。")
-    print("安装时勾选「Add Python to PATH」选项。")
+    print("如果 pip 不可用，说明 Python 未正确安装：")
+    print("https://www.python.org/downloads/（安装时勾选 Add Python to PATH）")
     print("=" * 60)
     input("\n按回车键退出...")
     sys.exit(1)
 
-# ── 启动应用 ──────────────────────────────────────────────────
-# 确保工作目录是程序所在文件夹（避免相对路径问题）
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
+# 确保相对路径以程序目录为基准（打包后不能用 __file__，它在临时解压目录里）
+from config import get_app_dir
 
-# 导入并启动主应用
+os.chdir(get_app_dir())
+
 from app import DiskCleanerApp
 
+
+def _write_crash_log(exc_text: str) -> str:
+    """把崩溃信息写到配置目录，返回日志路径"""
+    try:
+        from config import get_config_dir
+        log_path = os.path.join(get_config_dir(), "error.log")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write("\n===== %s =====\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+            f.write(exc_text)
+        return log_path
+    except Exception:
+        return ""
+
+
 def main():
-    """程序主函数"""
-    app = DiskCleanerApp()
-    # mainloop() 启动GUI事件循环，程序在这里"运行"
-    # 直到用户关闭窗口，mainloop() 才会返回
-    app.mainloop()
+    try:
+        app = DiskCleanerApp()
+        app.mainloop()
+    except Exception:
+        exc_text = traceback.format_exc()
+        log_path = _write_crash_log(exc_text)
+        sys.stderr.write(exc_text)
+        try:
+            from tkinter import messagebox
+            messagebox.showerror(
+                "程序异常退出",
+                "发生了未处理的错误。\n\n"
+                + (("日志已保存到：\n%s\n\n" % log_path) if log_path else "")
+                + exc_text[-1200:])
+        except Exception:
+            pass
+        raise
 
 
-# Python的惯例：只有直接运行这个文件时才执行 main()
-# 如果其他文件 import main，不会自动执行
 if __name__ == "__main__":
     main()

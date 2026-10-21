@@ -1,7 +1,6 @@
-# 磁盘清理助手 - Python依赖列表
-# 安装方法：在命令提示符中运行  pip install -r requirements.txt
-
-# customtkinter：现代化的Python GUI库
-# 提供圆角按钮、深色主题、进度条等美观控件
-# 官网：https://github.com/TomSchimansky/CustomTkinter
-customtkinter>=5.2.0
+# 磁盘清理助手 - Python 依赖
+# 安装：pip install -r requirements.txt
+#
+# 仅 GUI 需要 customtkinter；cleaner.py / analyzer.py 可脱离 GUI 单独运行。
+# 5.2.x 在 Python 3.8 上验证通过。6.x 变更较大，暂不放开。
+customtkinter>=5.2.0,<6.0

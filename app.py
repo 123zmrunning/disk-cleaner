@@ -3,14 +3,17 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 import webbrowser
 import threading
+import queue
 import subprocess
 import os
-import sys
 import json
+import time
 
-from config import load_config, save_config, get_desktop_path, get_app_dir
-from scanner import run_wiztree_scan, build_export_path
+from config import HISTORY_FILE, load_config, save_config, get_desktop_path
+from scanner import run_wiztree_scan, build_export_path, find_wiztree
 from analyzer import run_analysis, CleanupItem, KNOWLEDGE_DATE, KNOWLEDGE_SOURCES
+from cleaner import (default_backup_root, execute_items, is_elevated,
+                     prune_backups, restart_as_admin)
 from reporter import generate_report, bytes_to_human
 
 WIZTREE_DOWNLOAD_URL = "https://www.diskanalyzer.com/download"
@@ -55,36 +58,70 @@ def _open_folder(path: str):
             subprocess.Popen(f'explorer "{parent}"')
 
 
+def _big_file_hint(path: str) -> str:
+    """给大文件榜加一句人话说明"""
+    name = os.path.basename(path).lower()
+    if name == "hiberfil.sys":
+        return "休眠文件，可 powercfg /h off 关闭"
+    if name == "pagefile.sys":
+        return "虚拟内存，建议移到 D 盘"
+    if name == "swapfile.sys":
+        return "系统交换文件，由系统管理"
+    if name.endswith((".vhdx", ".vhd")):
+        return "虚拟磁盘（WSL/Docker/虚拟机）"
+    if name.endswith(".iso"):
+        return "系统镜像，可移到 D 盘"
+    if name.endswith(".dmp"):
+        return "内存转储，排障后可删"
+    if name.endswith(".zip") or name.endswith(".7z"):
+        return "压缩包，确认后可删或迁移"
+    return ""
+
+
 class DiskCleanerApp(ctk.CTk):
 
     def __init__(self):
         super().__init__()
         self.config = load_config()
         self.session_csv_path = None  # 本次会话扫描生成的 CSV（用于关闭时询问）
+        self.analysis_result = None
+        self.guide_items = []
+        self.big_files = []
+        self._overview_table = None
+        self._exec_cancel = threading.Event()
+        self._exec_queue = queue.Queue()
+        self._exec_running = False
 
         ctk.set_appearance_mode(self.config.get("theme", "dark"))
         ctk.set_default_color_theme("blue")
 
-        self.title("磁盘清理助手 v3.0  |  C盘空间分析工具")
-        self.geometry("1060x740")
-        self.minsize(860, 620)
+        self.title("磁盘清理助手 v3.1  |  C盘空间分析与安全清理")
+        self.geometry("1100x760")
+        self.minsize(880, 640)
 
         icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
         if os.path.exists(icon_path):
             self.iconbitmap(icon_path)
 
-        self.analysis_result = None
         self._cleanup_checkboxes = {}
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        if not self.config.get("wiztree_path"):
+        if not find_wiztree(self.config.get("wiztree_path", "")):
             self.after(500, self._show_wiztree_dialog)
+        self.after(2000, self._prune_old_backups)
 
     # ── 关闭处理 ────────────────────────────────────────────────────
 
     def _on_close(self):
-        """关闭窗口时：询问是否保留本次扫描的 CSV 文件"""
+        """关闭窗口时：先确认没有正在执行的清理，再询问是否保留 CSV"""
+        if self._exec_running:
+            if not messagebox.askyesno(
+                    "清理正在进行",
+                    "清理任务尚未结束，现在关闭会中断后续项目（已处理的文件不会回滚）。\n\n仍要关闭？"):
+                return
+            self._exec_cancel.set()
+
         csv = self.session_csv_path
         if csv and os.path.isfile(csv):
             size_kb = os.path.getsize(csv) // 1024
@@ -129,7 +166,8 @@ class DiskCleanerApp(ctk.CTk):
         ctk.CTkLabel(path_frame, text="WizTree:", width=65,
                      font=ctk.CTkFont(size=12)).grid(row=0, column=0, padx=5)
         self.wiztree_path_var = ctk.StringVar(
-            value=self.config.get("wiztree_path", "") or "（未设置）")
+            value=(self.config.get("wiztree_path", "")
+                   or find_wiztree("") or "（未设置）"))
         ctk.CTkEntry(path_frame, textvariable=self.wiztree_path_var,
                      state="readonly", font=ctk.CTkFont(size=11),
                      height=30).grid(row=0, column=1, padx=5, sticky="ew")
@@ -180,6 +218,7 @@ class DiskCleanerApp(ctk.CTk):
         self.tab_overview = self.tabview.add("📊 磁盘概况")
         self.tab_cleanup  = self.tabview.add("🧹 清理建议")
         self.tab_detail   = self.tabview.add("📁 目录详情")
+        self.tab_bigfiles = self.tabview.add("📦 大文件")
         self.tab_report   = self.tabview.add("📄 报告操作")
         self.tab_history  = self.tabview.add("📋 历史记录")
         self.tab_settings = self.tabview.add("⚙️ 设置")
@@ -187,6 +226,7 @@ class DiskCleanerApp(ctk.CTk):
         self._build_tab_overview()
         self._build_tab_cleanup()
         self._build_tab_detail()
+        self._build_tab_bigfiles()
         self._build_tab_report()
         self._build_tab_history()
         self._build_tab_settings()
@@ -253,6 +293,25 @@ class DiskCleanerApp(ctk.CTk):
             ctk.CTkLabel(scroll, text="扫描后显示",
                          text_color=COLORS["text_dim"]).grid(row=0, column=0, pady=30)
 
+    def _build_tab_bigfiles(self):
+        tab = self.tab_bigfiles
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            tab,
+            text="C 盘最大的文件（≥100MB）\n"
+                 "pagefile.sys / hiberfil.sys / .vhdx / ISO 往往才是空间真正的大头，"
+                 "先看这里再决定要不要清缓存。",
+            font=ctk.CTkFont(size=12), justify="left",
+            text_color=COLORS["text_dim"]).grid(row=0, column=0, sticky="w", padx=10, pady=8)
+
+        self.bigfiles_scroll = ctk.CTkScrollableFrame(tab, label_text="")
+        self.bigfiles_scroll.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+        self.bigfiles_scroll.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(self.bigfiles_scroll, text="扫描完成后显示",
+                     text_color=COLORS["text_dim"]).grid(row=0, column=0, pady=30)
+
     def _build_tab_report(self):
         tab = self.tab_report
         tab.grid_columnconfigure(0, weight=1)
@@ -261,16 +320,15 @@ class DiskCleanerApp(ctk.CTk):
             tab,
             text=(
                 "📄  报告操作说明\n\n"
-                "• 点击「保存分析报告」将完整分析结果保存为 Markdown 文件\n"
-                "• Markdown 文件可用记事本打开，也可用 Typora、VS Code 等查看格式化效果\n\n"
-                "📁  生成的文件\n\n"
-                "• WizTree 扫描文件：WizTree_scan_YYYYMMDD_HHMMSS.csv\n"
-                "  → 保存目录在「⚙️ 设置」选项卡中配置（默认：桌面）\n"
-                "• 分析报告：磁盘清理分析报告_YYYYMMDD_HHMM.md\n"
-                "  → 保存目录在「⚙️ 设置」选项卡中配置（默认：桌面）\n\n"
-                "🗑️  执行清理说明\n\n"
-                "• 软件会列出将要删除的路径和大小，等待你确认后才会执行\n"
-                "• 建议先从「立即清理」级别开始，风险最低"
+                "• 「保存分析报告」把完整结果写成 Markdown，可用记事本 / Typora / VS Code 打开\n"
+                "• 报告包含：磁盘概况、大文件榜、可执行清理项、只读建议、预期效果\n\n"
+                "🗑️  清理说明（重要）\n\n"
+                "• 优先级 1/2 的缓存会直接删除；需要备份的项会移动到备份目录，不会立刻消失\n"
+                "• 执行前会列出真实路径、文件数、可回收量，确认后才会动手\n"
+                "• 受系统保护的目录（WinSxS、Installer、Program Files、文档、桌面）一律拒绝删除\n"
+                "• 失败、被占用、权限不足都会如实记录，不会再把失败报成成功\n\n"
+                "💾  备份位置\n\n"
+                "• 默认 C:\\DiskCleaner_Backup\\<时间戳>\\，保留天数可在「设置」里调整"
             ),
             font=ctk.CTkFont(size=13), justify="left").grid(
             row=0, column=0, padx=20, pady=20, sticky="nw")
@@ -279,22 +337,28 @@ class DiskCleanerApp(ctk.CTk):
         btn_frame.grid(row=1, column=0, padx=20, pady=10, sticky="w")
 
         self.save_report_btn = ctk.CTkButton(
-            btn_frame, text="💾  保存分析报告", width=180, height=40,
+            btn_frame, text="💾  保存分析报告", width=170, height=40,
             font=ctk.CTkFont(size=13), command=self._on_save_report,
             state="disabled", fg_color=COLORS["info"])
         self.save_report_btn.pack(side="left", padx=5)
 
         self.exec_cleanup_btn = ctk.CTkButton(
-            btn_frame, text="🗑️  执行清理（优先级1）", width=200, height=40,
+            btn_frame, text="🗑️  清理优先级 1（预览）", width=210, height=40,
             font=ctk.CTkFont(size=13), command=self._on_exec_cleanup,
             state="disabled", fg_color=COLORS["danger"], hover_color="#c0392b")
         self.exec_cleanup_btn.pack(side="left", padx=5)
 
         self.exec_selected_btn = ctk.CTkButton(
-            btn_frame, text="☑️  执行选中项", width=200, height=40,
+            btn_frame, text="☑️  清理选中项（预览）", width=200, height=40,
             font=ctk.CTkFont(size=13), command=self._on_exec_selected,
             state="disabled", fg_color=COLORS["warning"], hover_color="#d35400")
         self.exec_selected_btn.pack(side="left", padx=5)
+
+        self.cancel_exec_btn = ctk.CTkButton(
+            btn_frame, text="⏹ 停止", width=90, height=40,
+            font=ctk.CTkFont(size=13), command=self._on_cancel_exec,
+            state="disabled", fg_color="gray40", hover_color="gray50")
+        self.cancel_exec_btn.pack(side="left", padx=5)
 
         self.last_csv_label = ctk.CTkLabel(tab, text="",
                                            font=ctk.CTkFont(size=11),
@@ -385,6 +449,68 @@ class DiskCleanerApp(ctk.CTk):
                       fg_color="gray40", hover_color="gray50").grid(row=0, column=2)
         row += 1
 
+        # ── 清理与备份 ──────────────────────────────────────────────
+        ctk.CTkLabel(tab, text="🧹  清理与备份",
+                     font=ctk.CTkFont(size=14, weight="bold")).grid(
+            row=row, column=0, columnspan=4, sticky="w", padx=15, pady=(20, 4))
+        row += 1
+        ctk.CTkFrame(tab, height=1, fg_color=("gray70", "gray35")).grid(
+            row=row, column=0, columnspan=4, sticky="ew", padx=15, pady=(0, 10))
+        row += 1
+
+        admin_row = ctk.CTkFrame(tab, fg_color="transparent")
+        admin_row.grid(row=row, column=0, columnspan=4, sticky="ew", padx=15, pady=4)
+        admin_row.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(admin_row, text="运行权限：", width=130, anchor="e").grid(
+            row=0, column=0, padx=(0, 5))
+        self.admin_status_label = ctk.CTkLabel(
+            admin_row, text="", anchor="w", font=ctk.CTkFont(size=12))
+        self.admin_status_label.grid(row=0, column=1, sticky="w")
+        self.admin_btn = ctk.CTkButton(
+            admin_row, text="以管理员身份重启", width=130, height=32,
+            command=self._on_restart_admin)
+        self.admin_btn.grid(row=0, column=2, padx=4)
+        row += 1
+        self._refresh_admin_status()
+
+        backup_row = ctk.CTkFrame(tab, fg_color="transparent")
+        backup_row.grid(row=row, column=0, columnspan=4, sticky="ew", padx=15, pady=4)
+        backup_row.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(backup_row, text="备份目录：", width=130, anchor="e").grid(
+            row=0, column=0, padx=(0, 5))
+        self.backup_dir_var = ctk.StringVar(
+            value=self.config.get("backup_dir") or default_backup_root())
+        ctk.CTkEntry(backup_row, textvariable=self.backup_dir_var,
+                     state="readonly", height=32).grid(
+            row=0, column=1, sticky="ew", padx=5)
+        ctk.CTkButton(backup_row, text="浏览", width=65, height=32,
+                      command=self._on_browse_backup_dir).grid(row=0, column=2, padx=4)
+        ctk.CTkButton(backup_row, text="打开", width=65, height=32,
+                      fg_color="gray40", hover_color="gray50",
+                      command=lambda: _open_folder(self.backup_dir_var.get())).grid(
+            row=0, column=3, padx=(2, 15))
+        row += 1
+
+        retention_row = ctk.CTkFrame(tab, fg_color="transparent")
+        retention_row.grid(row=row, column=0, columnspan=4, sticky="ew", padx=15, pady=4)
+        ctk.CTkLabel(retention_row, text="备份保留：", width=130, anchor="e").grid(
+            row=0, column=0, padx=(0, 5))
+        self.retention_menu = ctk.CTkOptionMenu(
+            retention_row, values=["3 天", "7 天", "14 天", "30 天"],
+            width=110, command=self._on_retention_change)
+        self.retention_menu.grid(row=0, column=1, sticky="w")
+        self.retention_menu.set("%d 天" % self.config.get("backup_retention_days", 7))
+        ctk.CTkButton(retention_row, text="立即清理过期备份", width=150, height=32,
+                      fg_color="gray40", hover_color="gray50",
+                      command=self._on_prune_backups).grid(row=0, column=2, padx=4)
+        row += 1
+        ctk.CTkLabel(tab, text="备份目录用于存放「建议备份」类项目；"
+                              "超过保留天数后会在启动时自动清理。",
+                     font=ctk.CTkFont(size=11),
+                     text_color=COLORS["text_dim"]).grid(
+            row=row, column=0, columnspan=4, sticky="w", padx=15, pady=(0, 8))
+        row += 1
+
         # ── 关于 / 知识库 ────────────────────────────────────────────
         ctk.CTkLabel(tab, text="ℹ️  关于本软件",
                      font=ctk.CTkFont(size=14, weight="bold")).grid(
@@ -398,14 +524,14 @@ class DiskCleanerApp(ctk.CTk):
         about_box.grid(row=row, column=0, columnspan=4, sticky="ew", padx=15, pady=(0, 15))
         ctk.CTkLabel(about_box,
                      text=(
-                         f"磁盘清理助手  v3.0          知识库更新日期：{KNOWLEDGE_DATE}\n\n"
-                         f"本次联网核实新增/更新的清理规则：\n"
-                         f"  • AMD GPU 着色器缓存（DxCache / GLCache）\n"
-                         f"  • DirectX 系统着色器缓存（D3DSCache）\n"
-                         f"  • 系统缩略图缓存（Thumbnail Cache）\n"
-                         f"  • Windows 错误报告转储（WER）\n"
-                         f"  • Windows 预读缓存（Prefetch，低风险）\n"
-                         f"  • 核实：WinSxS 不可直接删除，已从规则中排除\n\n"
+                         f"磁盘清理助手  v3.1          知识库更新日期：{KNOWLEDGE_DATE}\n\n"
+                         f"v3.1 主要改动：\n"
+                         f"  • 新增安全删除引擎（cleaner.py）：保护目录、junction 检测、真实释放量\n"
+                         f"  • 重写全部规则，修掉会误删 Firefox 配置 / KOOK / Razer / 剪映草稿的宽匹配\n"
+                         f"  • 系统组件（WinSxS、Installer、WindowsApps）改为「只建议」\n"
+                         f"  • 新增：Windows\\Temp、传递优化、CBS 日志、崩溃转储、大文件榜\n"
+                         f"  • CSV 流式解析，整盘导出不再吃满内存\n"
+                         f"  • 扫描改用「CSV 写完」判定，支持管理员模式\n\n"
                          f"知识来源：{KNOWLEDGE_SOURCES}"
                      ),
                      font=ctk.CTkFont(size=11), justify="left", anchor="w").pack(
@@ -499,6 +625,74 @@ class DiskCleanerApp(ctk.CTk):
         var.set("（默认：桌面）")
         self._set_status(f"{key} 已重置为桌面")
 
+    # ── 备份 / 管理员相关设置 ───────────────────────────────────────
+
+    def _on_browse_backup_dir(self):
+        path = filedialog.askdirectory(
+            title="选择备份目录",
+            initialdir=self.backup_dir_var.get() or get_desktop_path())
+        if path:
+            self.config["backup_dir"] = path
+            save_config(self.config)
+            self.backup_dir_var.set(path)
+            self._set_status("备份目录已更新：%s" % path)
+
+    def _on_retention_change(self, value: str):
+        try:
+            days = int(str(value).split()[0])
+        except (TypeError, ValueError):
+            return
+        self.config["backup_retention_days"] = days
+        save_config(self.config)
+        self._set_status("备份保留期已设为 %d 天" % days)
+
+    def _on_prune_backups(self):
+        root = self.config.get("backup_dir") or default_backup_root()
+        days = int(self.config.get("backup_retention_days", 7))
+        try:
+            removed = prune_backups(root, days)
+        except OSError as e:
+            messagebox.showerror("清理失败", str(e))
+            return
+        if removed:
+            messagebox.showinfo("清理完成", "已删除 %d 个过期备份批次。" % len(removed))
+        else:
+            messagebox.showinfo("无需清理", "没有超过 %d 天的备份。" % days)
+
+    def _refresh_admin_status(self):
+        if is_elevated():
+            self.admin_status_label.configure(
+                text="管理员（MFT 快速扫描，可处理系统目录）",
+                text_color=COLORS["success"])
+            self.admin_btn.configure(state="disabled")
+        else:
+            self.admin_status_label.configure(
+                text="普通用户（系统目录会被跳过，扫描较慢）",
+                text_color=COLORS["warning"])
+            self.admin_btn.configure(state="normal")
+
+    def _on_restart_admin(self):
+        if is_elevated():
+            messagebox.showinfo("已经是管理员", "当前进程已具备管理员权限。")
+            return
+        if not messagebox.askyesno(
+                "以管理员身份重启",
+                "重启后会用管理员权限重新打开本程序，未保存的扫描结果会丢失。\n\n继续？"):
+            return
+        if restart_as_admin():
+            self.destroy()
+        else:
+            messagebox.showwarning("未重启", "UAC 被取消，或启动失败。")
+
+    def _prune_old_backups(self):
+        root = self.config.get("backup_dir") or default_backup_root()
+        try:
+            removed = prune_backups(root, int(self.config.get("backup_retention_days", 7)))
+        except OSError:
+            return
+        if removed:
+            self._set_status("已自动清理 %d 个过期备份" % len(removed))
+
     def _toggle_theme(self):
         if self.theme_switch.get():
             ctk.set_appearance_mode("dark")
@@ -511,10 +705,12 @@ class DiskCleanerApp(ctk.CTk):
         save_config(self.config)
 
     def _on_scan_click(self):
-        wiztree_path = self.config.get("wiztree_path", "")
-        if not wiztree_path or not os.path.isfile(wiztree_path):
+        wiztree_path = find_wiztree(self.config.get("wiztree_path", ""))
+        if not wiztree_path:
             self._show_wiztree_dialog()
             return
+        if not is_elevated():
+            self._set_status("普通权限扫描（如需更完整结果，可在设置里以管理员身份重启）")
         self.scan_btn.configure(state="disabled", text="扫描中...")
         self.progress_bar.set(0)
         self._set_progress("正在准备扫描...", 0.05)
@@ -524,10 +720,16 @@ class DiskCleanerApp(ctk.CTk):
         export_dir = self.config.get("csv_dir", "") or get_desktop_path()
         export_path = build_export_path(export_dir)
 
-        self.after(0, lambda: self._set_progress("正在启动WizTree扫描...", 0.1))
+        self.after(0, lambda: self._set_progress("正在启动 WizTree 扫描...", 0.1))
+        timeout = int(self.config.get("scan_timeout_sec", 900))
+        export_files = bool(self.config.get("export_files", True))
+        admin_mode = self.config.get("admin_scan", "auto") == "always"
+        use_admin = is_elevated() and (admin_mode or self.config.get("admin_scan", "auto") == "auto")
+
         success, result = run_wiztree_scan(
-            self.config["wiztree_path"], export_path,
-            lambda msg: self.after(0, lambda: self._set_progress(msg, 0.3)))
+            self.config.get("wiztree_path", ""), export_path,
+            lambda msg: self.after(0, lambda: self._set_progress(msg, 0.35)),
+            timeout=timeout, export_files=export_files, use_admin=use_admin)
 
         if not success:
             self.after(0, lambda: self._on_scan_error(result))
@@ -554,20 +756,23 @@ class DiskCleanerApp(ctk.CTk):
 
     def _on_scan_complete(self, analysis: dict, csv_path: str):
         self.analysis_result = analysis
+        self.guide_items = analysis.get("guide_items", [])
+        self.big_files = analysis.get("big_files", [])
         self.session_csv_path = csv_path  # 记录本次会话的 CSV，关闭时询问
 
         self._set_progress("分析完成！", 1.0)
-        self._set_status(f"分析完成 | CSV：{os.path.basename(csv_path)}")
+        self._set_status("分析完成 | CSV：%s" % os.path.basename(csv_path))
 
         self._update_tab_overview(analysis)
         self._update_tab_cleanup(analysis)
         self._update_tab_detail(analysis)
+        self._update_tab_bigfiles()
 
         self.save_report_btn.configure(state="normal")
         self.exec_cleanup_btn.configure(state="normal")
-        self.exec_selected_btn.configure(state="normal")
+        self._on_checkbox_change()
         self.scan_btn.configure(state="normal", text="🚀  开始扫描 C盘")
-        self.last_csv_label.configure(text=f"最近扫描文件：{csv_path}")
+        self.last_csv_label.configure(text="最近扫描文件：%s" % csv_path)
         self.tabview.set("🧹 清理建议")
 
     # ── 界面更新 ────────────────────────────────────────────────────
@@ -653,9 +858,16 @@ class DiskCleanerApp(ctk.CTk):
         self.after(80, lambda: self._draw_treemap(self._treemap_canvas, top_level1, disk_info))
 
         # ── 顶级目录表格 ────────────────────────────────────────────
+        # 每次扫描重建前先销毁旧表，避免控件泄漏
+        if self._overview_table is not None:
+            try:
+                self._overview_table.destroy()
+            except Exception:
+                pass
         table_frame = ctk.CTkScrollableFrame(
             self.tab_overview,
-            label_text=f"C:\\ 下一级目录 Top {len(top_level1)}（点击📂可打开文件夹）")
+            label_text="C:\\ 下一级目录 Top %d（点击📂可打开文件夹）" % len(top_level1))
+        self._overview_table = table_frame
         table_frame.grid(row=2, column=0, sticky="nsew", padx=10, pady=5)
         self.tab_overview.grid_rowconfigure(2, weight=1)
         table_frame.grid_columnconfigure(1, weight=1)
@@ -747,19 +959,27 @@ class DiskCleanerApp(ctk.CTk):
     def _update_tab_cleanup(self, analysis: dict):
         self._cleanup_checkboxes = {}
         cleanup_items = analysis.get("cleanup_items", [])
+        guide_items = analysis.get("guide_items", [])
         reclaimable = analysis.get("total_reclaimable_bytes", 0)
-        p1_count = sum(1 for x in cleanup_items if x.priority == 1)
-        self.cleanup_summary.configure(
-            text=f"共发现 {len(cleanup_items)} 个清理项 | "
-                 f"立即可清理 {p1_count} 项 | "
-                 f"无风险可回收 {bytes_to_human(reclaimable)}",
-            text_color="white")
+        backup_bytes = analysis.get("backup_bytes", 0)
+        p1_count = sum(1 for x in cleanup_items
+                       if x.priority == 1 and x.action == "delete")
+        admin_count = sum(1 for x in cleanup_items if x.requires_admin)
+
+        summary = ("可执行 %d 项 | 立即清理 %d 项 | 可直接回收 %s"
+                   % (len(cleanup_items), p1_count, bytes_to_human(reclaimable)))
+        if backup_bytes:
+            summary += " | 需备份 %s" % bytes_to_human(backup_bytes)
+        if admin_count:
+            summary += " | %d 项需管理员" % admin_count
+        summary += " | 只建议 %d 项" % len(guide_items)
+        self.cleanup_summary.configure(text=summary, text_color="white")
 
         self.cleanup_hint.grid_forget()
         for widget in self.cleanup_scroll.winfo_children():
             widget.destroy()
 
-        if not cleanup_items:
+        if not cleanup_items and not guide_items:
             ctk.CTkLabel(self.cleanup_scroll, text="未发现明显的可清理项目。",
                          text_color=COLORS["success"]).grid(row=0, column=0, pady=30)
             return
@@ -771,28 +991,47 @@ class DiskCleanerApp(ctk.CTk):
                 current_priority = item.priority
                 color = PRIORITY_COLORS.get(current_priority, "gray")
                 ctk.CTkLabel(self.cleanup_scroll,
-                             text=f"  {PRIORITY_LABELS.get(current_priority, '')}",
+                             text="  %s" % PRIORITY_LABELS.get(current_priority, ""),
                              font=ctk.CTkFont(size=14, weight="bold"),
                              text_color=color, anchor="w").grid(
                     row=row, column=0, sticky="ew", padx=5, pady=(12, 3))
                 row += 1
-
             card = self._make_cleanup_card(self.cleanup_scroll, item)
             card.grid(row=row, column=0, sticky="ew", padx=5, pady=3)
             row += 1
+
+        if guide_items:
+            ctk.CTkLabel(self.cleanup_scroll,
+                         text="  🟢 只建议（系统组件 / 真实数据，不会自动删除）",
+                         font=ctk.CTkFont(size=14, weight="bold"),
+                         text_color=COLORS["success"], anchor="w").grid(
+                row=row, column=0, sticky="ew", padx=5, pady=(18, 3))
+            row += 1
+            for item in guide_items:
+                card = self._make_cleanup_card(self.cleanup_scroll, item)
+                card.grid(row=row, column=0, sticky="ew", padx=5, pady=3)
+                row += 1
+
+        self._on_checkbox_change()
 
     def _make_cleanup_card(self, parent, item: CleanupItem) -> ctk.CTkFrame:
         color = PRIORITY_COLORS.get(item.priority, "gray")
         card = ctk.CTkFrame(parent, corner_radius=8, border_width=1, border_color=color)
         card.grid_columnconfigure(2, weight=1)
 
-        # 勾选框
-        var = ctk.BooleanVar(value=False)
-        self._cleanup_checkboxes[item.path] = var
-        cb = ctk.CTkCheckBox(card, variable=var, text="", width=26, height=26,
-                             checkbox_width=20, checkbox_height=20,
-                             command=self._on_checkbox_change)
-        cb.grid(row=0, column=0, rowspan=5, padx=(8, 0), pady=5)
+        # 勾选框（只建议项不可勾选）
+        if item.action == "guide":
+            ctk.CTkLabel(card, text="只\n读", width=26,
+                         font=ctk.CTkFont(size=10),
+                         text_color=COLORS["text_dim"]).grid(
+                row=0, column=0, rowspan=5, padx=(8, 0), pady=5)
+        else:
+            var = ctk.BooleanVar(value=False)
+            self._cleanup_checkboxes[item.path] = var
+            cb = ctk.CTkCheckBox(card, variable=var, text="", width=26, height=26,
+                                 checkbox_width=20, checkbox_height=20,
+                                 command=self._on_checkbox_change)
+            cb.grid(row=0, column=0, rowspan=5, padx=(8, 0), pady=5)
 
         # 左侧彩色竖条
         ctk.CTkFrame(card, width=5, fg_color=color, corner_radius=4).grid(
@@ -824,9 +1063,20 @@ class DiskCleanerApp(ctk.CTk):
                       command=lambda p=item.path: _open_folder(p)).grid(
             row=0, column=1, padx=(6, 8))
 
-        # 风险 + 操作方法
-        ctk.CTkLabel(card, text=f"风险：{item.risk}  ｜  操作：{item.method}",
-                     font=ctk.CTkFont(size=11), anchor="w").grid(
+        # 风险 + 操作方法 + 额外标记
+        badges = []
+        if item.action == "backup":
+            badges.append("💾 移入备份")
+        if item.action == "guide":
+            badges.append("🟢 只建议")
+        if item.requires_admin:
+            badges.append("🔒 需管理员")
+        if item.count_files:
+            badges.append("📄 %d 个文件" % item.count_files)
+        prefix = (" ｜ ".join(badges) + " ｜ ") if badges else ""
+        ctk.CTkLabel(card, text="%s风险：%s  ｜  操作：%s" % (prefix, item.risk, item.method),
+                     font=ctk.CTkFont(size=11), anchor="w",
+                     wraplength=720, justify="left").grid(
             row=2, column=2, sticky="ew", pady=2)
 
         # 折叠的判断依据
@@ -877,6 +1127,47 @@ class DiskCleanerApp(ctk.CTk):
         fill_scroll(self.local_scroll, analysis.get("top_appdata_local", []))
         fill_scroll(self.roaming_scroll, analysis.get("top_appdata_roaming", []))
 
+    def _update_tab_bigfiles(self):
+        for w in self.bigfiles_scroll.winfo_children():
+            w.destroy()
+        self.bigfiles_scroll.grid_columnconfigure(1, weight=1)
+
+        if not self.big_files:
+            ctk.CTkLabel(self.bigfiles_scroll,
+                         text="没有发现 ≥100MB 的文件（或扫描时关闭了文件导出）。",
+                         text_color=COLORS["text_dim"],
+                         font=ctk.CTkFont(size=12)).grid(row=0, column=0, pady=30)
+            return
+
+        for col, text in enumerate(["#", "文件", "大小", "", ""]):
+            ctk.CTkLabel(self.bigfiles_scroll, text=text,
+                         font=ctk.CTkFont(weight="bold")).grid(
+                row=0, column=col, padx=6, pady=3,
+                sticky="w" if col == 1 else "")
+
+        for i, entry in enumerate(self.big_files, 1):
+            bg = ("gray90", "gray20") if i % 2 == 0 else ("gray85", "gray25")
+            ctk.CTkLabel(self.bigfiles_scroll, text=str(i), width=28,
+                         fg_color=bg, corner_radius=3).grid(
+                row=i, column=0, padx=4, pady=2, sticky="ew")
+            ctk.CTkLabel(self.bigfiles_scroll, text=entry.path, anchor="w",
+                         fg_color=bg, corner_radius=3,
+                         font=ctk.CTkFont(size=11)).grid(
+                row=i, column=1, padx=4, pady=2, sticky="ew")
+            ctk.CTkLabel(self.bigfiles_scroll, text=bytes_to_human(entry.size_bytes),
+                         width=80, fg_color=bg, corner_radius=3).grid(
+                row=i, column=2, padx=4, pady=2)
+            hint = _big_file_hint(entry.path)
+            ctk.CTkLabel(self.bigfiles_scroll, text=hint, width=210,
+                         fg_color=bg, corner_radius=3,
+                         font=ctk.CTkFont(size=10),
+                         text_color=COLORS["text_dim"], anchor="w").grid(
+                row=i, column=3, padx=4, pady=2, sticky="ew")
+            ctk.CTkButton(self.bigfiles_scroll, text="📂", width=34, height=24,
+                          fg_color="transparent", hover_color=("gray80", "gray30"),
+                          command=lambda p=entry.path: _open_folder(p)).grid(
+                row=i, column=4, padx=4, pady=2)
+
     # ── 报告和清理 ──────────────────────────────────────────────────
 
     def _on_save_report(self):
@@ -884,7 +1175,11 @@ class DiskCleanerApp(ctk.CTk):
             messagebox.showwarning("无数据", "请先执行扫描。")
             return
         output_dir = self.config.get("report_dir", "") or get_desktop_path()
-        success, result = generate_report(self.analysis_result, output_dir)
+        success, result = generate_report(
+            self.analysis_result, output_dir,
+            meta={"admin": is_elevated(),
+                  "backup_retention": self.config.get("backup_retention_days", 7),
+                  "csv_path": self.session_csv_path or ""})
         if success:
             messagebox.showinfo("报告已保存",
                                 f"报告已保存到：\n{result}\n\n可用记事本或Typora打开查看。")
@@ -895,82 +1190,172 @@ class DiskCleanerApp(ctk.CTk):
     def _on_exec_cleanup(self):
         if not self.analysis_result:
             return
-        p1_items = [x for x in self.analysis_result.get("cleanup_items", [])
-                    if x.priority == 1]
-        if not p1_items:
-            messagebox.showinfo("无可清理项", "没有找到「立即清理」级别的项目。")
+        items = [x for x in self.analysis_result.get("cleanup_items", [])
+                 if x.priority == 1 and x.action == "delete"]
+        if not items:
+            messagebox.showinfo("无可清理项", "没有找到「立即清理」级别的可删除项目。")
             return
+        self._start_execution(items, "优先级 1")
 
-        preview = "\n".join(
-            f"  • {item.name}\n    路径：{item.path}\n    大小：{bytes_to_human(item.size_bytes)}"
-            for item in p1_items)
-        total = bytes_to_human(sum(x.size_bytes for x in p1_items))
-
-        if not messagebox.askyesno("确认清理",
-                                   f"即将删除以下「立即清理」级别项目（共 {total}）：\n\n"
-                                   f"{preview}\n\n确认删除？（此操作不可撤销）"):
+    def _on_exec_selected(self):
+        if not self.analysis_result:
             return
+        selected = [item for item in self.analysis_result.get("cleanup_items", [])
+                    if self._cleanup_checkboxes.get(item.path) is not None
+                    and self._cleanup_checkboxes[item.path].get()]
+        if not selected:
+            messagebox.showinfo("未选择", "请先勾选要处理的项目。")
+            return
+        self._start_execution(selected, "选中项")
 
-        self._set_status("正在执行清理...")
-        errors = []
-        for item in p1_items:
-            path = item.path.strip('"')
-            try:
-                subprocess.run(
-                    ["powershell", "-Command",
-                     f'Remove-Item -Path "{path}" -Recurse -Force -ErrorAction SilentlyContinue'],
-                    timeout=60, capture_output=True)
-            except Exception as e:
-                errors.append(f"{item.name}: {e}")
-
-        freed = sum(x.size_bytes for x in p1_items)
-        self._save_history_record(p1_items, freed)
-        self._update_tab_history()
-        if errors:
-            messagebox.showwarning("部分清理失败", "以下项目清理失败：\n" + "\n".join(errors))
-        else:
-            messagebox.showinfo("清理完成", f"清理完成！共释放约 {total}。\n\n建议重新扫描查看最新状态。")
-        self._set_status("清理完成")
-
-    # ── 勾选框相关 ──────────────────────────────────────────────────
+    # ── 勾选框 ──────────────────────────────────────────────────────
 
     def _on_checkbox_change(self):
         any_checked = any(v.get() for v in self._cleanup_checkboxes.values())
-        state = "normal" if any_checked else "disabled"
-        self.exec_selected_btn.configure(state=state)
+        if not self._exec_running:
+            self.exec_selected_btn.configure(
+                state="normal" if any_checked else "disabled")
 
-    def _on_exec_selected(self):
-        selected = [item for item in self.analysis_result.get("cleanup_items", [])
-                    if self._cleanup_checkboxes.get(item.path, ctk.BooleanVar()).get()]
-        if not selected:
-            messagebox.showinfo("未选择", "请先勾选要清理的项目。")
+    # ── 执行清理（后台线程 + 真实结果）──────────────────────────────
+
+    def _build_preview(self, items):
+        lines = []
+        for item in items[:10]:
+            tags = []
+            if item.action == "backup":
+                tags.append("备份")
+            if item.requires_admin:
+                tags.append("需管理员")
+            mark = ("[%s] " % "/".join(tags)) if tags else ""
+            lines.append("  • %s%s（%s）\n    %s" % (
+                mark, item.name, bytes_to_human(item.size_bytes), item.path))
+        if len(items) > 10:
+            lines.append("  … 以及另外 %d 项" % (len(items) - 10))
+        return "\n".join(lines)
+
+    def _start_execution(self, items, title):
+        if self._exec_running:
+            messagebox.showinfo("请稍候", "正在执行上一次清理，请等待完成。")
             return
-        preview = "\n".join(
-            f"  • {item.name}\n    路径：{item.path}\n    大小：{bytes_to_human(item.size_bytes)}"
-            for item in selected)
-        total = bytes_to_human(sum(x.size_bytes for x in selected))
-        if not messagebox.askyesno("确认清理",
-                                   f"即将删除以下选中项目（共 {total}）：\n\n{preview}\n\n确认删除？（此操作不可撤销）"):
+
+        total = sum(x.size_bytes for x in items)
+        backup_total = sum(x.size_bytes for x in items if x.action == "backup")
+        note = ""
+        if backup_total:
+            note = ("\n\n其中约 %s 会移入备份目录，不会立刻释放空间。"
+                    % bytes_to_human(backup_total))
+        if any(x.requires_admin for x in items) and not is_elevated():
+            note += "\n\n有项目需要管理员权限，当前是普通权限，这些项会被跳过或失败。"
+
+        if not messagebox.askyesno(
+                "确认执行（%s）" % title,
+                "即将处理 %d 项，共 %s：\n\n%s%s\n\n确认继续？"
+                % (len(items), bytes_to_human(total), self._build_preview(items), note)):
             return
-        self._set_status("正在执行清理...")
-        errors = []
-        for item in selected:
-            path = item.path.strip('"')
+
+        self._exec_running = True
+        self._exec_cancel.clear()
+        self.exec_cleanup_btn.configure(state="disabled")
+        self.exec_selected_btn.configure(state="disabled")
+        self.scan_btn.configure(state="disabled")
+        self.cancel_exec_btn.configure(state="normal")
+        self._set_progress("开始清理...", 0.0)
+        self._set_status("正在清理...")
+
+        threading.Thread(target=self._exec_worker, args=(items,), daemon=True).start()
+        self.after(100, self._poll_exec_queue)
+
+    def _exec_worker(self, items):
+        try:
+            results = execute_items(
+                items,
+                backup_root=self.config.get("backup_dir") or None,
+                progress=lambda done, total, name: self._exec_queue.put(
+                    ("progress", done, total, name)),
+                cancel=self._exec_cancel,
+                retention_days=int(self.config.get("backup_retention_days", 7)))
+        except Exception as e:  # 后台线程不能把异常抛回 Tk
+            results = []
+            self._exec_queue.put(("error", str(e)))
+        self._exec_queue.put(("done", results))
+
+    def _poll_exec_queue(self):
+        finished = False
+        while True:
             try:
-                subprocess.run(
-                    ["powershell", "-Command",
-                     f'Remove-Item -Path "{path}" -Recurse -Force -ErrorAction SilentlyContinue'],
-                    timeout=60, capture_output=True)
-            except Exception as e:
-                errors.append(f"{item.name}: {e}")
-        freed = sum(x.size_bytes for x in selected)
-        self._save_history_record(selected, freed)
+                msg = self._exec_queue.get_nowait()
+            except queue.Empty:
+                break
+            if msg[0] == "progress":
+                _kind, done_n, total_n, name = msg
+                value = (done_n / total_n) if total_n else 0
+                self._set_progress("清理中：%s（%d/%d）" % (name, done_n, total_n), value)
+            elif msg[0] == "error":
+                self._set_status("清理异常：%s" % msg[1])
+            elif msg[0] == "done":
+                finished = True
+                self._finish_execution(msg[1])
+        if not finished and self._exec_running:
+            self.after(150, self._poll_exec_queue)
+
+    def _on_cancel_exec(self):
+        if self._exec_running:
+            self._exec_cancel.set()
+            self._set_status("正在停止（当前项完成后停止）...")
+
+    def _finish_execution(self, results):
+        self._exec_running = False
+        self.exec_cleanup_btn.configure(state="normal")
+        self.exec_selected_btn.configure(state="normal")
+        self.scan_btn.configure(state="normal", text="🚀  开始扫描 C盘")
+        self.cancel_exec_btn.configure(state="disabled")
+        self._set_progress("清理结束", 1.0)
+
+        if not results:
+            self._set_status("没有执行任何清理")
+            return
+
+        freed = sum(r.bytes_freed for r in results)
+        moved = sum(r.bytes_moved for r in results)
+        deleted = [r for r in results if r.status == "deleted"]
+        moved_items = [r for r in results if r.status == "moved"]
+        skipped = [r for r in results if r.status in ("skipped", "denied", "missing")]
+        failed = [r for r in results if r.status == "failed"]
+
+        self._save_history_record(results)
         self._update_tab_history()
-        if errors:
-            messagebox.showwarning("部分清理失败", "以下项目清理失败：\n" + "\n".join(errors))
+
+        # 已处理的项不应再保持勾选
+        for var in self._cleanup_checkboxes.values():
+            try:
+                var.set(False)
+            except Exception:
+                pass
+        self._on_checkbox_change()
+
+        lines = ["实际释放：%s" % bytes_to_human(freed)]
+        if moved:
+            lines.append("移入备份：%s（%d 项）" % (bytes_to_human(moved), len(moved_items)))
+        lines.append("成功删除：%d 项" % len(deleted))
+        if skipped:
+            lines.append("跳过/拒绝：%d 项" % len(skipped))
+        if failed:
+            lines.append("失败：%d 项" % len(failed))
+
+        detail = []
+        for r in results:
+            if r.status in ("failed", "denied", "skipped") and r.errors:
+                detail.append("· %s：%s（%s）" % (r.name, r.status_label, r.errors[0]))
+        if detail:
+            lines.append("")
+            lines.append("需要注意：")
+            lines.extend(detail[:8])
+
+        if failed or skipped:
+            messagebox.showwarning("清理完成（有跳过项）", "\n".join(lines))
         else:
-            messagebox.showinfo("清理完成", f"清理完成！共释放约 {total}。\n\n建议重新扫描查看最新状态。")
-        self._set_status("清理完成")
+            messagebox.showinfo("清理完成", "\n".join(lines))
+        self._set_status("清理完成：释放 %s" % bytes_to_human(freed))
 
     # ── 历史记录标签页 ───────────────────────────────────────────────
 
@@ -1004,31 +1389,38 @@ class DiskCleanerApp(ctk.CTk):
         self._update_tab_history()
 
     def _load_history(self) -> list:
-        path = os.path.join(get_app_dir(), "cleanup_history.json")
+        path = HISTORY_FILE
         if not os.path.isfile(path):
             return []
         try:
             with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except (OSError, ValueError):
             return []
 
-    def _save_history_record(self, items, freed_bytes: int):
-        path = os.path.join(get_app_dir(), "cleanup_history.json")
+    def _save_history_record(self, results):
         records = self._load_history()
         disk_pct = 0.0
         if self.analysis_result and self.analysis_result.get("disk_info"):
             disk_pct = self.analysis_result["disk_info"].used_percent
+        counts = {}
+        for r in results:
+            counts[r.status] = counts.get(r.status, 0) + 1
         records.append({
-            "time": __import__('time').strftime("%Y-%m-%d %H:%M"),
-            "items": [item.name for item in items],
-            "freed_bytes": freed_bytes,
+            "time": time.strftime("%Y-%m-%d %H:%M"),
+            "items": [r.name for r in results],
+            "status": counts,
+            "freed_bytes": sum(r.bytes_freed for r in results),
+            "moved_bytes": sum(r.bytes_moved for r in results),
             "disk_used_percent": disk_pct,
         })
+        records = records[-200:]
         try:
-            with open(path, "w", encoding="utf-8") as f:
+            os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
+            with open(HISTORY_FILE, "w", encoding="utf-8") as f:
                 json.dump(records, f, ensure_ascii=False, indent=2)
-        except Exception:
+        except OSError:
             pass
 
     def _update_tab_history(self):
@@ -1056,8 +1448,12 @@ class DiskCleanerApp(ctk.CTk):
                          font=ctk.CTkFont(size=11), wraplength=500).grid(row=0, column=1, sticky="ew", padx=5)
             freed = bytes_to_human(rec.get("freed_bytes", 0))
             pct = rec.get("disk_used_percent", 0)
-            ctk.CTkLabel(card, text=f"释放 {freed} | 使用率 {pct}%",
-                         font=ctk.CTkFont(size=10), text_color=COLORS["success"]).grid(row=0, column=2, padx=10)
+            extra = ""
+            if rec.get("moved_bytes"):
+                extra = " | 备份 %s" % bytes_to_human(rec["moved_bytes"])
+            ctk.CTkLabel(card, text="释放 %s%s | 使用率 %s%%" % (freed, extra, pct),
+                         font=ctk.CTkFont(size=10), text_color=COLORS["success"]).grid(
+                row=0, column=2, padx=10)
 
     def _draw_history_chart(self, canvas, records):
         canvas.update_idletasks()

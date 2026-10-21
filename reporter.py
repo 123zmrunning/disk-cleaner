@@ -1,181 +1,250 @@
 # ==============================================================
-# reporter.py —— 报告生成模块
+# reporter.py —— Markdown 报告生成
 # ==============================================================
-# 【作用】把分析结果转换成人类可读的Markdown报告文件，
-#         保存到桌面或用户指定目录。
-#
-# 【Markdown是什么】一种轻量级文本格式，用 # 表示标题，
-#   ** 表示加粗，| 表示表格。可以用记事本打开，
-#   也可以用 Typora、VS Code、语雀等工具渲染成好看的格式。
+# 报告只做展示，不执行任何删除。分四类内容：
+#   1. 磁盘概况与占用排行
+#   2. 可执行清理（delete / backup）
+#   3. 只建议（guide：WinSxS、Installer、休眠文件…）
+#   4. 长期治理建议
 # ==============================================================
 
 import os
 import time
-from analyzer import DiskInfo, CleanupItem, GB
 from typing import List, Optional
+
+from analyzer import CleanupItem, DiskInfo, GB
 from config import get_desktop_path
 
 
 def bytes_to_human(b: int) -> str:
-    """把字节数转换成人类易读的格式，如 4.77 GB 或 512 MB"""
+    """字节数转人类易读格式"""
     if b >= GB:
-        return f"{b / GB:.2f} GB"
-    elif b >= 1_048_576:
-        return f"{b / 1_048_576:.1f} MB"
-    else:
-        return f"{b / 1024:.0f} KB"
+        return "%.2f GB" % (b / GB)
+    if b >= 1_048_576:
+        return "%.1f MB" % (b / 1_048_576)
+    if b >= 1024:
+        return "%.0f KB" % (b / 1024)
+    return "%d B" % b
 
 
-def generate_report(analysis: dict, output_dir: str = ""):  # -> Tuple[bool, str]
+_ACTION_HEADERS = {
+    1: "### 🔴 优先级 1：立即清理（无风险）",
+    2: "### 🟠 优先级 2：高收益缓存（低风险）",
+    3: "### 🟡 优先级 3：需要重新生成/下载",
+    4: "### 🟢 优先级 4：建议备份或迁移",
+}
+
+
+def _item_block(lines: List[str], item: CleanupItem) -> None:
+    lines.append("#### %s" % item.name)
+    lines.append("")
+    lines.append("| 字段 | 内容 |")
+    lines.append("|------|------|")
+    lines.append("| 路径 | `%s` |" % item.path)
+    lines.append("| 大小 | %s |" % bytes_to_human(item.size_bytes))
+    if item.count_files:
+        lines.append("| 文件数 | %d |" % item.count_files)
+    lines.append("| 动作 | %s |" % ("移入备份" if item.action == "backup" else "删除"))
+    lines.append("| 风险 | %s |" % item.risk)
+    if item.requires_admin:
+        lines.append("| 权限 | 需要管理员 |")
+    lines.append("| 操作 | %s |" % item.method)
+    if item.source:
+        lines.append("| 依据 | %s |" % item.source)
+    lines.append("")
+    lines.append("**判断依据：**")
+    for reason_line in item.reason.strip().splitlines():
+        lines.append("> %s" % reason_line)
+    lines.append("")
+
+
+def generate_report(analysis: dict, output_dir: str = "",
+                    meta: Optional[dict] = None) -> tuple:
     """
-    生成Markdown格式的磁盘清理分析报告。
-
-    参数：
-      analysis   run_analysis()返回的分析结果字典
-      output_dir 报告保存目录，空字符串时保存到桌面
-
-    返回值：(成功: bool, 文件路径或错误信息: str)
+    生成 Markdown 报告。
+    meta 可包含：admin(bool)、backup_retention(int)、csv_path(str)
     """
+    meta = meta or {}
     if not output_dir:
         output_dir = get_desktop_path()
 
-    # 报告文件名包含日期，方便区分
     date_str = time.strftime("%Y%m%d_%H%M")
-    filename = f"磁盘清理分析报告_{date_str}.md"
-    output_path = os.path.join(output_dir, filename)
+    output_path = os.path.join(output_dir, "磁盘清理分析报告_%s.md" % date_str)
 
-    # 从分析结果中取出各部分数据
     disk_info: Optional[DiskInfo] = analysis.get("disk_info")
     top_level1 = analysis.get("top_level1", [])
     top_local = analysis.get("top_appdata_local", [])
     top_roaming = analysis.get("top_appdata_roaming", [])
     cleanup_items: List[CleanupItem] = analysis.get("cleanup_items", [])
+    guide_items: List[CleanupItem] = analysis.get("guide_items", [])
+    big_files = analysis.get("big_files", [])
     reclaimable = analysis.get("total_reclaimable_bytes", 0)
+    backup_bytes = analysis.get("backup_bytes", 0)
 
-    # ── 开始拼接报告内容 ──────────────────────────────────────────
-    lines = []   # 用列表收集每一行，最后join成字符串（比字符串拼接效率高）
-
-    lines.append(f"# 磁盘清理分析报告")
-    lines.append(f"")
+    lines: List[str] = []
+    lines.append("# 磁盘清理分析报告")
+    lines.append("")
     if disk_info:
-        lines.append(f"> 扫描时间：{disk_info.scan_time}")
-    lines.append(f"> 报告生成：{time.strftime('%Y年%m月%d日 %H:%M:%S')}")
-    lines.append(f"> 由「磁盘清理助手」自动生成")
-    lines.append(f"")
+        lines.append("> 扫描时间：%s" % disk_info.scan_time)
+    lines.append("> 报告生成：%s" % time.strftime("%Y年%m月%d日 %H:%M:%S"))
+    lines.append("> 运行权限：%s" % ("管理员" if meta.get("admin") else "普通用户"))
+    if meta.get("csv_path"):
+        lines.append("> 数据来源：`%s`" % meta["csv_path"])
+    lines.append("")
+    lines.append("> 本报告不执行任何删除操作，仅用于展示分析结果。")
+    lines.append("")
 
-    # ── 第一部分：磁盘概况 ────────────────────────────────────────
-    lines.append(f"## 一、磁盘概况（C 盘）")
-    lines.append(f"")
+    # ── 一、磁盘概况 ────────────────────────────────────────────
+    lines.append("## 一、磁盘概况（C 盘）")
+    lines.append("")
     if disk_info:
-        used_pct = disk_info.used_percent
-        warning = " ⚠️ 空间较紧张，建议清理" if used_pct >= 80 else ""
-        lines.append(f"| 项目 | 数值 |")
-        lines.append(f"|------|------|")
-        lines.append(f"| 总容量 | {disk_info.total_gb} GB |")
-        lines.append(f"| 已用空间 | {disk_info.used_gb} GB |")
-        lines.append(f"| 剩余空间 | **{disk_info.free_gb} GB** |")
-        lines.append(f"| 使用率 | **{used_pct}%**{warning} |")
+        warning = " ⚠️ 空间紧张" if disk_info.used_percent >= 80 else ""
+        lines.append("| 项目 | 数值 |")
+        lines.append("|------|------|")
+        lines.append("| 总容量 | %s GB |" % disk_info.total_gb)
+        lines.append("| 已用空间 | %s GB |" % disk_info.used_gb)
+        lines.append("| 剩余空间 | **%s GB** |" % disk_info.free_gb)
+        lines.append("| 使用率 | **%s%%**%s |" % (disk_info.used_percent, warning))
     else:
-        lines.append("_（无法获取磁盘信息）_")
-    lines.append(f"")
+        lines.append("_（CSV 中没有读取到磁盘容量信息）_")
+    lines.append("")
 
-    # ── 第二部分：空间占用总览 ────────────────────────────────────
-    lines.append(f"## 二、C 盘空间占用总览（前 {len(top_level1)} 大目录）")
-    lines.append(f"")
+    # ── 二、占用排行 ────────────────────────────────────────────
+    lines.append("## 二、空间占用排行")
+    lines.append("")
     if top_level1:
-        lines.append(f"| 排名 | 路径 | 大小 |")
-        lines.append(f"|------|------|------|")
-        for i, f in enumerate(top_level1, 1):
-            lines.append(f"| {i} | `{f.path}` | {bytes_to_human(f.size_bytes)} |")
-    lines.append(f"")
+        lines.append("### C:\\ 下一级目录")
+        lines.append("")
+        lines.append("| 排名 | 路径 | 大小 |")
+        lines.append("|------|------|------|")
+        for i, folder in enumerate(top_level1, 1):
+            lines.append("| %d | `%s` | %s |" % (i, folder.path, bytes_to_human(folder.size_bytes)))
+        lines.append("")
+    if big_files:
+        lines.append("### 大文件 TOP %d（≥100MB）" % len(big_files))
+        lines.append("")
+        lines.append("| 文件 | 大小 | 说明 |")
+        lines.append("|------|------|------|")
+        for entry in big_files:
+            lines.append("| `%s` | %s | %s |" % (
+                entry.path, bytes_to_human(entry.size_bytes),
+                _file_hint(entry.path)))
+        lines.append("")
 
-    # ── 第三部分：清理建议 ────────────────────────────────────────
-    lines.append(f"## 三、清理建议（按优先级）")
-    lines.append(f"")
-
-    priority_headers = {
-        1: "### 🔴 优先级1：立即清理（无风险）",
-        2: "### 🟠 优先级2：高收益缓存（低风险）",
-        3: "### 🟡 优先级3：游戏着色器缓存（需重新编译）",
-        4: "### 🟢 优先级4：谨慎操作（建议用软件自带功能）",
-    }
-
-    # 按优先级分组输出
-    current_priority = 0
+    # ── 三、可执行清理 ──────────────────────────────────────────
+    lines.append("## 三、可执行清理（按优先级）")
+    lines.append("")
+    if not cleanup_items:
+        lines.append("_没有发现符合规则的清理项。_")
+        lines.append("")
+    current_priority = -1
     for item in cleanup_items:
         if item.priority != current_priority:
             current_priority = item.priority
-            lines.append(f"")
-            lines.append(priority_headers.get(item.priority, f"### 优先级{item.priority}"))
-            lines.append(f"")
+            lines.append("")
+            lines.append(_ACTION_HEADERS.get(current_priority, "### 其他"))
+            lines.append("")
+        _item_block(lines, item)
 
-        lines.append(f"#### {item.name}")
-        lines.append(f"")
-        lines.append(f"- **路径**：`{item.path}`")
-        lines.append(f"- **大小**：{bytes_to_human(item.size_bytes)}")
-        lines.append(f"- **风险评估**：{item.risk}")
-        lines.append(f"- **操作方法**：{item.method}")
-        lines.append(f"")
-        lines.append(f"**判断依据：**")
-        # 把换行符转成Markdown换行（两个空格+换行）
-        for reason_line in item.reason.strip().split('\n'):
-            lines.append(f"> {reason_line}")
-        lines.append(f"")
+    # ── 四、只建议 ──────────────────────────────────────────────
+    lines.append("## 四、只建议（不自动删除）")
+    lines.append("")
+    lines.append("这些目录要么属于系统组件、要么是真实数据，"
+                 "**不应该由清理工具直接删除**，请按下面的官方方法处理。")
+    lines.append("")
+    if not guide_items:
+        lines.append("_没有需要特别提示的项目。_")
+        lines.append("")
+    for item in guide_items:
+        lines.append("### %s" % item.name)
+        lines.append("")
+        lines.append("- **路径**：`%s`" % item.path)
+        lines.append("- **大小**：%s" % bytes_to_human(item.size_bytes))
+        lines.append("- **做法**：%s" % item.method)
+        lines.append("- **风险**：%s" % item.risk)
+        for reason_line in item.reason.strip().splitlines():
+            lines.append("> %s" % reason_line)
+        lines.append("")
 
-    # ── 第四部分：预期效果汇总 ────────────────────────────────────
-    lines.append(f"## 四、预期效果汇总")
-    lines.append(f"")
-    if cleanup_items:
-        lines.append(f"| 清理项 | 大小 | 优先级 | 风险评估 |")
-        lines.append(f"|--------|------|--------|----------|")
-        for item in cleanup_items:
-            lines.append(
-                f"| {item.name} | {bytes_to_human(item.size_bytes)} "
-                f"| {item.priority_label} | {item.risk} |"
-            )
-        lines.append(f"")
-        lines.append(f"**预计最大可回收空间（优先级1+2）：{bytes_to_human(reclaimable)}**")
-    lines.append(f"")
+    # ── 五、预期效果 ────────────────────────────────────────────
+    lines.append("## 五、预期效果")
+    lines.append("")
+    lines.append("| 类别 | 大小 |")
+    lines.append("|------|------|")
+    lines.append("| 可直接删除（优先级 1+2） | **%s** |" % bytes_to_human(reclaimable))
+    if backup_bytes:
+        lines.append("| 需移入备份 | %s |" % bytes_to_human(backup_bytes))
+    lines.append("")
+    if reclaimable and disk_info and disk_info.total_bytes:
+        after = disk_info.used_percent - reclaimable / disk_info.total_bytes * 100
+        lines.append("清理后 C 盘使用率预计从 **%s%%** 降到 **%.1f%%**。"
+                     % (disk_info.used_percent, max(0.0, after)))
+        lines.append("")
 
-    # ── 第五部分：AppData 详细占用 ───────────────────────────────
-    lines.append(f"## 五、AppData 目录详细占用")
-    lines.append(f"")
-
+    # ── 六、AppData 详情 ────────────────────────────────────────
+    lines.append("## 六、AppData 目录占用")
+    lines.append("")
     if top_local:
-        lines.append(f"### AppData\\Local（前 {min(10, len(top_local))} 名）")
-        lines.append(f"")
-        lines.append(f"| 路径 | 大小 |")
-        lines.append(f"|------|------|")
-        for f in top_local[:10]:
-            lines.append(f"| `{f.path}` | {bytes_to_human(f.size_bytes)} |")
-        lines.append(f"")
-
+        lines.append("### AppData\\Local（前 %d 名）" % min(10, len(top_local)))
+        lines.append("")
+        lines.append("| 路径 | 大小 |")
+        lines.append("|------|------|")
+        for folder in top_local[:10]:
+            lines.append("| `%s` | %s |" % (folder.path, bytes_to_human(folder.size_bytes)))
+        lines.append("")
     if top_roaming:
-        lines.append(f"### AppData\\Roaming（前 {min(10, len(top_roaming))} 名）")
-        lines.append(f"")
-        lines.append(f"| 路径 | 大小 |")
-        lines.append(f"|------|------|")
-        for f in top_roaming[:10]:
-            lines.append(f"| `{f.path}` | {bytes_to_human(f.size_bytes)} |")
-        lines.append(f"")
+        lines.append("### AppData\\Roaming（前 %d 名）" % min(10, len(top_roaming)))
+        lines.append("")
+        lines.append("| 路径 | 大小 |")
+        lines.append("|------|------|")
+        for folder in top_roaming[:10]:
+            lines.append("| `%s` | %s |" % (folder.path, bytes_to_human(folder.size_bytes)))
+        lines.append("")
 
-    # ── 第六部分：长期建议 ────────────────────────────────────────
-    lines.append(f"## 六、长期建议")
-    lines.append(f"")
-    lines.append("1. **定期清理NVIDIA DXCache**：每1~2个月清理一次，每次可回收3~5 GB，无任何副作用。")
-    lines.append("2. **将游戏和大文件迁移到D盘**：这是长期保持C盘健康的最有效方法。")
-    lines.append("3. **微信聊天记录迁移**：微信→设置→聊天→迁移/备份聊天记录 → 选择D盘。")
-    lines.append("4. **关注C盘使用率**：建议保持在75%以下，低于这个值系统性能最佳。")
-    lines.append("5. **每次大型游戏更新后**：可以清理一次Shader缓存，避免旧缓存积累。")
-    lines.append(f"")
-    lines.append(f"---")
-    lines.append(f"_本报告由「磁盘清理助手」生成，清理规则基于公开的Windows系统知识，仅供参考。_")
+    # ── 七、长期建议 ────────────────────────────────────────────
+    lines.append("## 七、长期建议")
+    lines.append("")
+    advice = [
+        "**把会再长出来的东西迁走**：游戏库、Docker/WSL 磁盘、npm/pip 缓存、"
+        "微信文件目录都应放在 D 盘，而不是每次满了再清。",
+        "**系统组件用官方工具**：`DISM /Online /Cleanup-Image /StartComponentCleanup`"
+        "（清理 WinSxS 旧组件）、「设置 → 系统 → 存储 → 临时文件」、Storage Sense 自动清理。",
+        "**保持 15% 以上空闲**：C 盘使用率超过 85% 后，Windows 更新和虚拟内存都会受影响。",
+        "**大文件优先于小缓存**：先看本报告的大文件榜，再决定要不要清缓存。",
+    ]
+    if not meta.get("admin"):
+        advice.append("**以管理员身份运行**：可用 MFT 快速扫描，也能覆盖 `C:\\ESD`、"
+                      "`Windows\\Temp`、WER 等受保护目录。")
+    if backup_bytes:
+        advice.append("**备份会保留 %s 天**：确认无影响后可提前手动删除，"
+                      "或在设置里调整保留天数。" % meta.get("backup_retention", 7))
+    for i, text in enumerate(advice, 1):
+        lines.append("%d. %s" % (i, text))
+    lines.append("")
+    lines.append("---")
+    lines.append("_本报告由「磁盘清理助手」生成；清理规则基于公开的 Windows 系统知识，"
+                 "仅供参考，执行前请自行确认路径。_")
 
-    # ── 写入文件 ──────────────────────────────────────────────────
     try:
-        report_content = "\n".join(lines)
         with open(output_path, "w", encoding="utf-8") as f:
-            f.write(report_content)
+            f.write("\n".join(lines))
         return True, output_path
-    except IOError as e:
-        return False, f"报告保存失败：{e}"
+    except OSError as e:
+        return False, "报告保存失败：%s" % e
+
+
+def _file_hint(path: str) -> str:
+    name = os.path.basename(path).lower()
+    if name == "hiberfil.sys":
+        return "休眠文件，可用 powercfg /h off 关闭"
+    if name == "pagefile.sys":
+        return "虚拟内存文件，建议移到 D 盘"
+    if name == "swapfile.sys":
+        return "系统交换文件，由系统管理"
+    if name.endswith(".vhdx") or name.endswith(".vhd"):
+        return "虚拟磁盘（WSL/Docker/虚拟机），建议迁移"
+    if name.endswith(".iso"):
+        return "系统镜像，可移到 D 盘"
+    if name.endswith(".dmp"):
+        return "内存转储，排障后可删"
+    return ""

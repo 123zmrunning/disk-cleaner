@@ -1,10 +1,10 @@
 @echo off
 chcp 65001 >nul
-title 磁盘清理助手 v2.0 - 打包为 EXE
+title 磁盘清理助手 v3.1 - 打包为 EXE
 
 echo.
 echo  ╔══════════════════════════════════════════╗
-echo  ║     磁盘清理助手 v2.0  打包工具          ║
+echo  ║     磁盘清理助手 v3.1  打包工具          ║
 echo  ║     将程序打包为独立 .EXE，无需Python    ║
 echo  ╚══════════════════════════════════════════╝
 echo.
@@ -39,7 +39,7 @@ pyinstaller ^
   --onedir ^
   --windowed ^
   --collect-all customtkinter ^
-  --name "磁盘清理助手_v2" ^
+  --name "磁盘清理助手_v3.1" ^
   main.py
 
 if errorlevel 1 (
@@ -59,17 +59,17 @@ echo.
 echo  [3/3] 打包成功！
 echo.
 echo  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-echo   输出目录：dist\磁盘清理助手_v2\
+echo   输出目录：dist\磁盘清理助手_v3.1\
 echo.
 echo   如何在另一台电脑上使用：
-echo   将整个 dist\磁盘清理助手_v2\ 文件夹复制过去，
-echo   双击其中的 磁盘清理助手_v2.exe 即可运行。
+echo   将整个 dist\磁盘清理助手_v3.1\ 文件夹复制过去，
+echo   双击其中的 磁盘清理助手_v3.1.exe 即可运行。
 echo.
 echo   注意：必须复制整个文件夹，不能只复制 .exe 文件！
 echo  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 echo.
 
-if exist "dist\磁盘清理助手_v2" (
-    explorer "dist\磁盘清理助手_v2"
+if exist "dist\磁盘清理助手_v3.1" (
+    explorer "dist\磁盘清理助手_v3.1"
 )
 pause

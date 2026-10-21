@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title 磁盘清理助手 v2.0
+title 磁盘清理助手 v3.1
 
 echo  正在检查依赖...
 pip show customtkinter >nul 2>&1
