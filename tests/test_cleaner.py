@@ -5,6 +5,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -109,6 +110,47 @@ class ExecuteTest(unittest.TestCase):
         self.assertEqual(result.status, "deleted")
         self.assertTrue(os.path.isdir(root))
         self.assertEqual(os.listdir(root), [])
+
+    def test_locked_file_reports_partial_completion(self):
+        root = self._make_tree()
+        locked = os.path.join(root, "sub", "b.tmp")
+        unlink = os.unlink
+
+        def unlink_except_locked(path, *args, **kwargs):
+            if os.path.normcase(path) == os.path.normcase(locked):
+                raise PermissionError("文件被占用")
+            return unlink(path, *args, **kwargs)
+
+        with patch.object(cleaner.os, "unlink", side_effect=unlink_except_locked):
+            result = execute_item(FakeItem(root))
+        self.assertEqual(result.status, "partial")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status_label, "部分完成")
+        self.assertEqual(result.bytes_freed, 1000)
+        self.assertEqual(result.files, 1)
+        self.assertGreaterEqual(result.failed_operations, 1)
+        self.assertTrue(result.errors)
+        self.assertTrue(os.path.isfile(locked))
+
+    def test_zero_byte_file_deleted_before_failure_is_partial(self):
+        root = os.path.join(self.base, "empty_files")
+        os.makedirs(root)
+        with open(os.path.join(root, "empty.txt"), "wb"):
+            pass
+        with patch.object(cleaner.os, "rmdir", side_effect=PermissionError("目录被占用")):
+            result = execute_item(FakeItem(root))
+        self.assertEqual(result.status, "partial")
+        self.assertEqual(result.files, 1)
+        self.assertEqual(result.bytes_freed, 0)
+
+    def test_total_failure_is_not_success(self):
+        root = self._make_tree()
+        with patch.object(cleaner.os, "unlink", side_effect=PermissionError("文件被占用")):
+            result = execute_item(FakeItem(root))
+        self.assertEqual(result.status, "failed")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.files, 0)
+        self.assertGreater(result.failed_operations, 0)
 
     def test_files_target_only_matches_globs(self):
         root = os.path.join(self.base, "thumbs")

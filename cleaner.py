@@ -110,12 +110,13 @@ class ItemResult:
     name: str
     path: str
     action: str                     # delete / backup / guide
-    status: str                     # deleted / moved / skipped / denied / failed / guide / missing
+    status: str                     # deleted / partial / moved / skipped / denied / failed / guide / missing
     bytes_freed: int = 0            # 真正释放的字节数（backup 时为 0）
     bytes_moved: int = 0            # 移动到备份目录的字节数
     files: int = 0                  # 成功删除的文件数
     dest: str = ""                  # 备份后的新位置
     errors: List[str] = field(default_factory=list)
+    failed_operations: int = 0      # 失败的文件/目录操作数（错误文本最多保留 8 条）
 
     @property
     def ok(self) -> bool:
@@ -125,6 +126,7 @@ class ItemResult:
     def status_label(self) -> str:
         return {
             "deleted": "已删除",
+            "partial": "部分完成",
             "moved": "已移入备份",
             "skipped": "已跳过",
             "denied": "被安全策略拒绝",
@@ -490,10 +492,11 @@ def execute_item(item, backup_root: Optional[str] = None,
     result.bytes_freed = col.bytes
     result.files = col.files
     result.errors = col.errors[:MAX_ERRORS_KEPT]
-    if col.errors and col.bytes == 0:
+    result.failed_operations = col.skipped
+    if col.skipped and col.files == 0:
         result.status = "failed"
-    elif col.errors:
-        result.status = "deleted"
+    elif col.skipped:
+        result.status = "partial"
     else:
         result.status = "deleted"
     return result

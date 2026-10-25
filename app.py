@@ -1318,6 +1318,7 @@ class DiskCleanerApp(ctk.CTk):
         freed = sum(r.bytes_freed for r in results)
         moved = sum(r.bytes_moved for r in results)
         deleted = [r for r in results if r.status == "deleted"]
+        partial = [r for r in results if r.status == "partial"]
         moved_items = [r for r in results if r.status == "moved"]
         skipped = [r for r in results if r.status in ("skipped", "denied", "missing")]
         failed = [r for r in results if r.status == "failed"]
@@ -1337,6 +1338,10 @@ class DiskCleanerApp(ctk.CTk):
         if moved:
             lines.append("移入备份：%s（%d 项）" % (bytes_to_human(moved), len(moved_items)))
         lines.append("成功删除：%d 项" % len(deleted))
+        if partial:
+            lines.append("部分完成：%d 项（已删除 %d 个文件，失败操作 %d 次）" % (
+                len(partial), sum(r.files for r in partial),
+                sum(r.failed_operations for r in partial)))
         if skipped:
             lines.append("跳过/拒绝：%d 项" % len(skipped))
         if failed:
@@ -1344,18 +1349,19 @@ class DiskCleanerApp(ctk.CTk):
 
         detail = []
         for r in results:
-            if r.status in ("failed", "denied", "skipped") and r.errors:
+            if r.status in ("partial", "failed", "denied", "skipped") and r.errors:
                 detail.append("· %s：%s（%s）" % (r.name, r.status_label, r.errors[0]))
         if detail:
             lines.append("")
             lines.append("需要注意：")
             lines.extend(detail[:8])
 
-        if failed or skipped:
-            messagebox.showwarning("清理完成（有跳过项）", "\n".join(lines))
+        if partial or failed or skipped:
+            messagebox.showwarning("清理结束（有未完成项）", "\n".join(lines))
         else:
             messagebox.showinfo("清理完成", "\n".join(lines))
-        self._set_status("清理完成：释放 %s" % bytes_to_human(freed))
+        state = "清理结束（有未完成项）" if partial or failed or skipped else "清理完成"
+        self._set_status("%s：释放 %s" % (state, bytes_to_human(freed)))
 
     # ── 历史记录标签页 ───────────────────────────────────────────────
 
