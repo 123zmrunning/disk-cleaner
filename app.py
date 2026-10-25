@@ -95,7 +95,7 @@ class DiskCleanerApp(ctk.CTk):
         ctk.set_appearance_mode(self.config.get("theme", "dark"))
         ctk.set_default_color_theme("blue")
 
-        self.title("磁盘清理助手 v3.1  |  C盘空间分析与安全清理")
+        self.title("磁盘清理助手 v3.1.1  |  C盘空间分析与安全清理")
         self.geometry("1100x760")
         self.minsize(880, 640)
 

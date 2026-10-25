@@ -309,7 +309,7 @@ CLEANUP_RULES: List[dict] = [
           "删除该缓存目录", "✅ 无风险"),
     _rule(r"\\app_shell_cache$", "app_shell_cache", 2,
           "Electron 应用 Shell 缓存",
-          "Electron 应用（KOOK、钉钉、飞书等）的界面缓存，应用启动时自动重建。",
+          "该名称可能用于应用界面缓存，但名称本身不能确认所属软件与数据用途。",
           "先确认所属应用，再通过该应用的缓存管理功能清理",
           "⚠️ 仅凭目录名无法确认用途，不自动删除", action="guide"),
     _rule(_R + r"baidu\\[^\\]+\\(Cache|cache|temp)$", "baidu", 2,
