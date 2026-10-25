@@ -23,6 +23,8 @@ class DangerousPathTest(unittest.TestCase):
     """这些路径绝对不能出现可执行（delete/backup）的清理项"""
 
     DANGEROUS = [
+        r"C:\ProjectData\app_shell_cache",
+        r"C:\ProjectData\JetBrains\MyApp\caches",
         r"C:\Users\Me\AppData\Roaming\Mozilla",
         r"C:\Users\Me\AppData\Roaming\Mozilla\Firefox",
         r"C:\Users\Me\AppData\Roaming\Mozilla\Firefox\Profiles\abc123.default-release",
@@ -61,6 +63,7 @@ class DangerousPathTest(unittest.TestCase):
 
 class LegitCacheTest(unittest.TestCase):
     CASES = [
+        (r"C:\Users\Me\AppData\Local\JetBrains\PyCharm2026.2\caches", "delete", 2),
         (r"C:\Users\Me\AppData\Local\NVIDIA\DXCache", "delete", 1),
         (r"C:\Users\Me\AppData\Local\AMD\GLCache", "delete", 1),
         (r"C:\Users\Me\AppData\Local\Temp", "delete", 1),

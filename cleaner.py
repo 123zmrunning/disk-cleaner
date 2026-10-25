@@ -88,11 +88,13 @@ FIREFOX_PROFILE_RE = re.compile(
     r"\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles(\\|$)", re.IGNORECASE
 )
 
-# 白名单：即使位于 Program Files 下，也确实是可再生的缓存
+# 仅允许标准安装位置中的这三个 Steam 缓存目录例外。
+# 不能凭路径后缀跳过 System32、个人文档等保护。
 ALLOW_UNDER_PROTECTED = [
-    re.compile(r"\\Steam\\htmlcache$", re.IGNORECASE),
-    re.compile(r"\\Steam\\steamapps\\downloading$", re.IGNORECASE),
-    re.compile(r"\\Steam\\steamapps\\workshop\\downloads$", re.IGNORECASE),
+    re.compile(
+        r"^%sProgram Files(?: \(x86\))?\\Steam\\"
+        r"(?:htmlcache|steamapps\\downloading|steamapps\\workshop\\downloads)$"
+        % re.escape(SYSTEM_DRIVE), re.IGNORECASE),
 ]
 
 MAX_ERRORS_KEPT = 8
@@ -207,23 +209,24 @@ def path_is_safe(path: str) -> Tuple[bool, str]:
     if drive.upper() != SYSTEM_DRIVE.upper():
         return False, "只允许清理系统盘（%s）" % SYSTEM_DRIVE
 
-    for pattern in ALLOW_UNDER_PROTECTED:
-        if pattern.search(p):
-            break
-    else:
-        if p.upper() in {x.upper() for x in PROTECTED_EXACT}:
-            return False, "系统保护目录：%s" % p
-        for prefix in PROTECTED_PREFIXES:
-            if _under(p, prefix):
-                return False, "系统保护目录：%s" % prefix
-        if USER_PROTECTED_RE.search(p):
-            return False, "个人文档 / 桌面等目录受保护"
-        if USER_ROOT_RE.match(p):
-            return False, "用户配置根目录受保护"
-        if USER_PROFILE_PROTECTED_RE.search(p):
-            return False, "用户配置根目录受保护"
-        if STORE_PACKAGE_RE.search(p):
-            return False, "商店应用数据目录受保护"
+    if p.upper() in {x.upper() for x in PROTECTED_EXACT}:
+        return False, "系统保护目录：%s" % p
+    steam_cache = any(pattern.fullmatch(p) for pattern in ALLOW_UNDER_PROTECTED)
+    program_dirs = {os.path.join(SYSTEM_DRIVE, name).lower()
+                    for name in ("Program Files", "Program Files (x86)")}
+    for prefix in PROTECTED_PREFIXES:
+        if _under(p, prefix):
+            if steam_cache and prefix.lower() in program_dirs:
+                continue
+            return False, "系统保护目录：%s" % prefix
+    if USER_PROTECTED_RE.search(p):
+        return False, "个人文档 / 桌面等目录受保护"
+    if USER_ROOT_RE.match(p):
+        return False, "用户配置根目录受保护"
+    if USER_PROFILE_PROTECTED_RE.search(p):
+        return False, "用户配置根目录受保护"
+    if STORE_PACKAGE_RE.search(p):
+        return False, "商店应用数据目录受保护"
 
     if FIREFOX_PROFILE_RE.search(p):
         return False, "Firefox 配置目录（书签/密码）受保护"

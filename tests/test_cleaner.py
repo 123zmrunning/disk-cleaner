@@ -26,6 +26,22 @@ class FakeItem(object):
 
 
 class SafetyTest(unittest.TestCase):
+    def test_steam_suffix_cannot_bypass_protected_locations(self):
+        for base in (r"C:\Windows\System32", r"C:\Users\Me\Documents",
+                     r"C:\Users\Me\Desktop", r"C:\ProgramData\Package Cache"):
+            for suffix in (r"Steam\htmlcache", r"Steam\steamapps\downloading",
+                           r"Steam\steamapps\workshop\downloads"):
+                with self.subTest(base=base, suffix=suffix):
+                    self.assertFalse(path_is_safe(os.path.join(base, suffix))[0])
+
+    def test_only_standard_steam_install_has_program_files_exception(self):
+        for base in (r"C:\Program Files\Steam", r"C:\Program Files (x86)\Steam"):
+            for suffix in ("htmlcache", r"steamapps\downloading",
+                           r"steamapps\workshop\downloads"):
+                self.assertTrue(path_is_safe(os.path.join(base, suffix))[0])
+        self.assertFalse(path_is_safe(r"C:\Program Files\Other\Steam\htmlcache")[0])
+        self.assertFalse(path_is_safe(r"C:\Program Files\Steam\steamapps\common")[0])
+
     def test_rejects_drive_root_and_system_dirs(self):
         blocked = [
             "C:\\",
