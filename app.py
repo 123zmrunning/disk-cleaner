@@ -688,7 +688,8 @@ class DiskCleanerApp(ctk.CTk):
         root = self.config.get("backup_dir") or default_backup_root()
         try:
             removed = prune_backups(root, int(self.config.get("backup_retention_days", 7)))
-        except OSError:
+        except OSError as e:
+            self._set_status("过期备份清理未完成：%s" % e)
             return
         if removed:
             self._set_status("已自动清理 %d 个过期备份" % len(removed))

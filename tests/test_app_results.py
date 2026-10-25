@@ -52,6 +52,12 @@ class CleanupFeedbackTest(unittest.TestCase):
             DiskCleanerApp._finish_execution(self.view, [result])
         self.assertIn("权限不足", box.showwarning.call_args[0][1])
 
+    def test_automatic_backup_failure_is_visible(self):
+        self.view.config = {"backup_dir": r"C:\Backup", "backup_retention_days": 7}
+        with patch("app.prune_backups", side_effect=OSError("备份被占用")):
+            DiskCleanerApp._prune_old_backups(self.view)
+        self.assertIn("备份被占用", self.view._set_status.call_args[0][0])
+
 
 if __name__ == "__main__":
     unittest.main()

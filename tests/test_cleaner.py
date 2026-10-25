@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -200,6 +201,16 @@ class ExecuteTest(unittest.TestCase):
         manifest = os.path.join(backup_root, runs[0], "_manifest.json")
         self.assertTrue(os.path.isfile(manifest))
 
+    def test_backup_prune_failure_preserves_completed_results(self):
+        root = self._make_tree()
+        backup_root = os.path.join(self.base, "backup")
+        with patch.object(cleaner, "prune_backups", side_effect=OSError("旧备份被占用")):
+            results = execute_items([FakeItem(root, action="backup")],
+                                    backup_root=backup_root)
+        self.assertEqual([r.status for r in results], ["moved", "failed"])
+        self.assertTrue(os.path.isdir(results[0].dest))
+        self.assertIn("旧备份被占用", results[1].errors[0])
+
     def test_prune_only_removes_expired_manifested_runs(self):
         backup_root = os.path.join(self.base, "backup")
         run_dir = os.path.join(backup_root, "20200101_000000")
@@ -235,6 +246,108 @@ class ExecuteTest(unittest.TestCase):
         results = execute_items(items, cancel=Cancel())
         self.assertEqual(len(results), 1)
         self.assertTrue(os.path.isdir(items[1].path))
+
+
+class PruneSafetyTest(unittest.TestCase):
+    def setUp(self):
+        self.base = tempfile.mkdtemp(prefix="dc_prune_test_")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.run_dir = os.path.join(self.base, "20200101_000000")
+        os.makedirs(self.run_dir)
+        self.payload = os.path.join(self.run_dir, "data.bin")
+        with open(self.payload, "wb") as f:
+            f.write(b"backup")
+        write_backup_manifest(self.run_dir, [
+            ItemResult("cache", r"C:\Cache", "backup", "moved", bytes_moved=6)], 7)
+        self.manifest = os.path.join(self.run_dir, "_manifest.json")
+        old = time.time() - 9 * 86400
+        os.utime(self.manifest, (old, old))
+
+    def test_delete_failure_is_not_reported_as_removed(self):
+        with patch.object(cleaner.shutil, "rmtree", side_effect=PermissionError("被占用")):
+            with self.assertRaisesRegex(OSError, "被占用"):
+                prune_backups(self.base, 7)
+        self.assertTrue(os.path.isfile(self.payload))
+
+    def test_directory_must_actually_disappear(self):
+        with patch.object(cleaner.shutil, "rmtree"):
+            with self.assertRaisesRegex(OSError, "未完全删除"):
+                prune_backups(self.base, 7)
+
+    def test_protected_or_relative_root_never_reaches_delete(self):
+        with patch.object(cleaner.shutil, "rmtree") as remove:
+            for root in (r"C:\Windows\System32", r"C:\Users\Me\Documents", "relative"):
+                with self.subTest(root=root), self.assertRaises(OSError):
+                    prune_backups(root, 7)
+            remove.assert_not_called()
+
+    def test_linked_backup_root_is_refused(self):
+        original = cleaner._is_reparse
+        with patch.object(cleaner, "_is_reparse",
+                          side_effect=lambda p: p == self.base or original(p)), \
+                patch.object(cleaner.shutil, "rmtree") as remove:
+            with self.assertRaisesRegex(OSError, "junction/symlink"):
+                prune_backups(self.base, 7)
+            remove.assert_not_called()
+
+    def test_nested_reparse_point_is_refused(self):
+        original = os.stat
+
+        def reparse_stat(path, *args, **kwargs):
+            st = original(path, *args, **kwargs)
+            if path == self.payload:
+                return SimpleNamespace(st_mode=st.st_mode, st_mtime=st.st_mtime,
+                                       st_file_attributes=cleaner.FILE_ATTRIBUTE_REPARSE_POINT)
+            return st
+
+        with patch.object(cleaner.os, "stat", side_effect=reparse_stat), \
+                patch.object(cleaner.shutil, "rmtree") as remove:
+            with self.assertRaisesRegex(OSError, "junction/symlink"):
+                prune_backups(self.base, 7)
+            remove.assert_not_called()
+
+    def test_linked_manifest_is_refused_before_reading(self):
+        original = os.stat
+
+        def reparse_stat(path, *args, **kwargs):
+            st = original(path, *args, **kwargs)
+            if path == self.manifest and kwargs.get("follow_symlinks") is False:
+                return SimpleNamespace(st_mode=st.st_mode, st_mtime=st.st_mtime,
+                                       st_file_attributes=cleaner.FILE_ATTRIBUTE_REPARSE_POINT)
+            return st
+
+        with patch.object(cleaner.os, "stat", side_effect=reparse_stat), \
+                patch.object(cleaner.shutil, "rmtree") as remove:
+            with self.assertRaisesRegex(OSError, "备份清单是"):
+                prune_backups(self.base, 7)
+            remove.assert_not_called()
+
+    def test_unreadable_descendant_is_refused(self):
+        original = os.stat
+
+        def unreadable_stat(path, *args, **kwargs):
+            if path == self.payload:
+                raise PermissionError("无法检查属性")
+            return original(path, *args, **kwargs)
+
+        with patch.object(cleaner.os, "stat", side_effect=unreadable_stat), \
+                patch.object(cleaner.shutil, "rmtree") as remove:
+            with self.assertRaisesRegex(OSError, "无法检查属性"):
+                prune_backups(self.base, 7)
+            remove.assert_not_called()
+
+    def test_non_batch_directory_is_preserved(self):
+        os.rename(self.run_dir, os.path.join(self.base, "personal-data"))
+        self.assertEqual(prune_backups(self.base, 7), [])
+        self.assertTrue(os.path.isfile(os.path.join(self.base, "personal-data", "data.bin")))
+
+    def test_unrecognized_manifest_is_preserved(self):
+        with open(self.manifest, "w", encoding="utf-8") as f:
+            f.write('[{"prunable": true}]')
+        old = time.time() - 9 * 86400
+        os.utime(self.manifest, (old, old))
+        self.assertEqual(prune_backups(self.base, 7), [])
+        self.assertTrue(os.path.isfile(self.payload))
 
 
 if __name__ == "__main__":

@@ -530,8 +530,10 @@ def execute_items(items: Sequence, backup_root: Optional[str] = None,
         write_backup_manifest(run_dir, results, retention_days)
         try:
             prune_backups(os.path.dirname(run_dir), retention_days)
-        except OSError:
-            pass
+        except OSError as e:
+            results.append(ItemResult(
+                name="过期备份清理", path=os.path.dirname(run_dir),
+                action="backup", status="failed", errors=[str(e)]))
     return results
 
 
@@ -558,30 +560,79 @@ def write_backup_manifest(run_dir: str, results: Sequence[ItemResult],
         pass
 
 
+def _validate_backup_tree(path: str) -> None:
+    """备份自动删除前拒绝任何重解析点；读取属性失败也必须停止。"""
+    def check(entry_path):
+        st = os.stat(_long(entry_path), follow_symlinks=False)
+        if (stat.S_ISLNK(st.st_mode) or
+                getattr(st, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT):
+            raise OSError("备份中包含 junction/symlink，拒绝自动清理：%s" % entry_path)
+
+    def walk_error(error):
+        raise error
+
+    current = normalize(path)
+    while len(current) > 3:
+        check(current)
+        current = os.path.dirname(current)
+    for directory, dirs, files in os.walk(_long(path), followlinks=False,
+                                          onerror=walk_error):
+        for name in dirs + files:
+            check(os.path.join(directory, name))
+
+
 def prune_backups(root: str, retention_days: int) -> List[str]:
-    """删除超过保留期的备份批次（只删除带清单且 prunable 的批次）"""
+    """只删除安全路径中的过期备份；失败抛出 OSError，绝不报告假成功。"""
     removed: List[str] = []
-    if not root or not os.path.isdir(root) or retention_days <= 0:
+    if not root or retention_days <= 0:
+        return removed
+    if not os.path.isabs(root):
+        raise OSError("备份目录必须是绝对路径")
+    root = normalize(root)
+    safe, reason = path_is_safe(root)
+    if not safe:
+        raise OSError("拒绝自动清理备份：%s" % reason)
+    # 不扫描整棵备份树；每个过期批次单独校验。
+    if not os.path.isdir(_long(root)):
         return removed
     deadline = time.time() - retention_days * 86400
-    for name in os.listdir(root):
+    for name in os.listdir(_long(root)):
+        if not re.fullmatch(r"\d{8}_\d{6}(?:_\d+)?", name):
+            continue
         run_dir = os.path.join(root, name)
-        if not os.path.isdir(run_dir):
+        # 递归删除前固定边界，不能对根目录或边界之外的路径操作。
+        if (os.path.normcase(os.path.dirname(normalize(run_dir))) !=
+                os.path.normcase(root)):
+            raise OSError("备份批次超出备份目录：%s" % run_dir)
+        safe, reason = path_is_safe(run_dir)
+        if not safe:
+            raise OSError("拒绝自动清理备份：%s" % reason)
+        if not os.path.isdir(_long(run_dir)):
             continue
         manifest_path = os.path.join(run_dir, "_manifest.json")
-        if not os.path.isfile(manifest_path):
+        if not os.path.isfile(_long(manifest_path)):
             continue
         try:
-            with open(manifest_path, "r", encoding="utf-8") as f:
+            # 清单本身也不能是链接。
+            st = os.stat(_long(manifest_path), follow_symlinks=False)
+            if (stat.S_ISLNK(st.st_mode) or
+                    getattr(st, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT):
+                raise OSError("备份清单是 junction/symlink：%s" % manifest_path)
+            with open(_long(manifest_path), "r", encoding="utf-8") as f:
                 manifest = json.load(f)
-            if not manifest.get("prunable", False):
+            if (not isinstance(manifest, dict) or manifest.get("prunable") is not True
+                    or not isinstance(manifest.get("items"), list)
+                    or not manifest["items"] or not manifest.get("created")):
                 continue
-            if os.path.getmtime(manifest_path) > deadline:
+            if st.st_mtime > deadline:
                 continue
-            shutil.rmtree(run_dir, ignore_errors=True)
-            removed.append(run_dir)
-        except (OSError, ValueError):
+        except ValueError:  # 无法识别的清单不作为本工具的备份删除
             continue
+        _validate_backup_tree(run_dir)
+        shutil.rmtree(_long(run_dir))
+        if os.path.lexists(_long(run_dir)):
+            raise OSError("备份目录未完全删除：%s" % run_dir)
+        removed.append(run_dir)
     return removed
 
 
