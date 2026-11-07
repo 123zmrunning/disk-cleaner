@@ -1,0 +1,5 @@
+* text=auto
+
+# Preserve committed CRLF bytes in both clones and GitHub source ZIPs.
+# text eol=crlf alone would still put LF bytes in source archives.
+*.bat -text

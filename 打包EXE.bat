@@ -1,75 +1,43 @@
 @echo off
-chcp 65001 >nul
-title 磁盘清理助手 v3.1 - 打包为 EXE
+setlocal
+cd /d "%~dp0"
+if errorlevel 1 goto directory_error
+title Disk Cleaner - Build EXE
 
-echo.
-echo  ╔══════════════════════════════════════════╗
-echo  ║     磁盘清理助手 v3.1  打包工具          ║
-echo  ║     将程序打包为独立 .EXE，无需Python    ║
-echo  ╚══════════════════════════════════════════╝
-echo.
-
-REM ── 检查 Python ─────────────────────────────────────────────────
+if not exist "main.py" goto missing_files
+if not exist "requirements.txt" goto missing_files
 python --version >nul 2>&1
-if errorlevel 1 (
-    echo  [错误] 未检测到 Python！
-    echo.
-    echo  打包过程本身需要 Python，但打包完成后生成的 EXE 不需要 Python。
-    echo  请先安装 Python 3.8+：https://www.python.org/downloads/
-    echo  安装时务必勾选 "Add Python to PATH"
-    echo.
-    pause
-    exit /b 1
-)
+if errorlevel 1 goto missing_python
 
-echo  [1/3] 正在安装 PyInstaller...
-pip install pyinstaller customtkinter -q
-if errorlevel 1 (
-    echo  [错误] 安装失败，请检查网络连接或 pip 权限。
-    pause
-    exit /b 1
-)
-echo        安装完成。
-echo.
+echo [1/2] Installing build dependencies...
+python -m pip install -r requirements.txt pyinstaller
+if errorlevel 1 goto dependency_error
 
-echo  [2/3] 正在打包（约需 1~3 分钟，请耐心等待）...
-echo.
-pyinstaller ^
-  --noconfirm ^
-  --onedir ^
-  --windowed ^
-  --collect-all customtkinter ^
-  --name "磁盘清理助手_v3.1" ^
-  main.py
-
-if errorlevel 1 (
-    echo.
-    echo  [错误] 打包失败！请查看上方的错误信息。
-    echo.
-    echo  常见原因：
-    echo    1. 杀毒软件拦截了 PyInstaller（临时关闭后重试）
-    echo    2. 磁盘空间不足
-    echo    3. 代码文件有语法错误
-    echo.
-    pause
-    exit /b 1
-)
+echo [2/2] Building EXE...
+python -m PyInstaller --noconfirm --onedir --windowed --collect-all customtkinter --name DiskCleaner main.py
+if errorlevel 1 goto build_error
+if not exist "dist\DiskCleaner\DiskCleaner.exe" goto build_error
 
 echo.
-echo  [3/3] 打包成功！
-echo.
-echo  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-echo   输出目录：dist\磁盘清理助手_v3.1\
-echo.
-echo   如何在另一台电脑上使用：
-echo   将整个 dist\磁盘清理助手_v3.1\ 文件夹复制过去，
-echo   双击其中的 磁盘清理助手_v3.1.exe 即可运行。
-echo.
-echo   注意：必须复制整个文件夹，不能只复制 .exe 文件！
-echo  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-echo.
+echo [OK] EXE: "%CD%\dist\DiskCleaner\DiskCleaner.exe"
+echo Copy the ENTIRE dist\DiskCleaner folder when moving the app.
+if /i not "%~1"=="--no-pause" pause
+exit /b 0
 
-if exist "dist\磁盘清理助手_v3.1" (
-    explorer "dist\磁盘清理助手_v3.1"
-)
-pause
+:directory_error
+echo [ERROR] Cannot access the project directory.
+goto failed
+:missing_files
+echo [ERROR] Keep this BAT file next to main.py and requirements.txt.
+goto failed
+:missing_python
+echo [ERROR] Python was not found. Install Python 3.8+ and add it to PATH.
+goto failed
+:dependency_error
+echo [ERROR] Dependency installation failed. See the error above.
+goto failed
+:build_error
+echo [ERROR] EXE build failed. See the error above.
+:failed
+if /i not "%~1"=="--no-pause" pause
+exit /b 1
