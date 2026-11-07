@@ -58,6 +58,28 @@ python main.py
 首次启动会自动查找 `WizTree64.exe`（程序目录 → Program Files → 注册表卸载表）。
 找不到时可在「设置」里手动指定，或把 `WizTree64.exe` 放到程序目录。
 
+### 打包为 EXE
+
+在完整解压的项目目录中双击 `打包EXE.bat`。脚本会使用同一个 Python 安装
+`requirements.txt` 中的依赖和 PyInstaller，然后生成：
+
+```text
+dist\DiskCleaner\DiskCleaner.exe
+```
+
+打包后的程序无需安装 Python。复制到其他电脑时，必须复制整个
+`dist\DiskCleaner` 文件夹（包括 `_internal`），不能只复制 EXE。
+WizTree 仍需另外安装或手动指定路径。
+
+打包失败时，窗口会保留实际错误；依赖安装失败会停止，不会继续打包。
+命令行或自动检查可使用 `打包EXE.bat --no-pause`，失败时返回非零退出码。
+`启动.bat` 同样支持 `--no-pause`。
+
+若看到乱码和“不是内部或外部命令”，请使用修复后的完整源码重新解压。
+两个 BAT 文件使用纯 ASCII 内容、无 BOM、Windows CRLF 换行；中文说明放在本文件中。
+`.gitattributes` 保留 BAT 的原始换行，确保 GitHub 下载 ZIP 也包含 CRLF；
+`.editorconfig` 约束编辑器保存格式，Windows 回归测试检查文件格式和实际执行流程。
+
 ### 推荐流程
 
 1. 扫描 → 看「磁盘概况」和「大文件」

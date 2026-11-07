@@ -1,20 +1,40 @@
 @echo off
-chcp 65001 >nul
-title 磁盘清理助手 v3.1
+setlocal
+cd /d "%~dp0"
+if errorlevel 1 goto directory_error
+title Disk Cleaner
 
-echo  正在检查依赖...
-pip show customtkinter >nul 2>&1
-if errorlevel 1 (
-    echo  正在安装 customtkinter，首次启动需要联网，请稍候...
-    pip install customtkinter -q
-)
+if not exist "main.py" goto missing_files
+if not exist "requirements.txt" goto missing_files
+python --version >nul 2>&1
+if errorlevel 1 goto missing_python
 
-echo  正在启动...
+echo Checking dependencies...
+python -m pip show customtkinter >nul 2>&1
+if not errorlevel 1 goto launch
+python -m pip install -r requirements.txt
+if errorlevel 1 goto dependency_error
+
+:launch
+echo Starting Disk Cleaner...
 python main.py
+if errorlevel 1 goto launch_error
+exit /b 0
 
-if errorlevel 1 (
-    echo.
-    echo  [错误] 程序异常退出，请检查 Python 是否正确安装。
-    echo  下载地址：https://www.python.org/downloads/
-    pause
-)
+:directory_error
+echo [ERROR] Cannot access the project directory.
+goto failed
+:missing_files
+echo [ERROR] Keep this BAT file next to main.py and requirements.txt.
+goto failed
+:missing_python
+echo [ERROR] Python was not found. Install Python 3.8+ and add it to PATH.
+goto failed
+:dependency_error
+echo [ERROR] Dependency installation failed. See the error above.
+goto failed
+:launch_error
+echo [ERROR] The app exited with an error. See the traceback above.
+:failed
+if /i not "%~1"=="--no-pause" pause
+exit /b 1
